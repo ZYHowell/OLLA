@@ -284,6 +284,26 @@ class Scheduler:
         generate_vars = defaultdict(lambda: {})
         preserve_vars = defaultdict(lambda: {})
         fetch_vars = defaultdict(lambda: {})
+        # Both prefetch and page at t means after computing operator at t
+        # preserve == live and value is valid(ready); live == live but value may
+        # be invalid(during prefetch)
+        # is_prefetching and is_paging at t means the status during computing op
+        # at t: page_start[t-1] -> is_paging[t], generate_vars[t] -> page_end[t]
+        live_vars = defaultdict(lambda: {})
+        prefetch_start = defaultdict(lambda: {})
+        prefetch_end = defaultdict(lambda: {})
+        page_start = defaultdict(lambda: {})
+        page_end = defaultdict(lambda: {})
+        is_prefetching = defaultdict(lambda: {})
+        is_paging = defaultdict(lambda: {})
+        has_sis = {}
+        has_sie = {}
+        has_sos = {}
+        has_soe = {}
+        sis = defaultdict(lambda: [])
+        sie = defaultdict(lambda: [])
+        sos = defaultdict(lambda: [])
+        soe = defaultdict(lambda: [])
 
         for e in self.graph.edges.values():
             lb, ub = makespan[e]
@@ -294,6 +314,24 @@ class Scheduler:
                 preserve_vars[e][t] = v
                 v = solver.create_binary_var(e.name + "_fetch_ts" + str(t))
                 fetch_vars[e][t] = v
+                v = solver.create_binary_var(e.name + "_fetch_start_ts" + str(t))
+                prefetch_start[e][t] = v
+                sis[t].append(v)
+
+                v = solver.create_binary_var(e.name + "_fetch_end_ts" + str(t))
+                prefetch_end[e][t] = v
+                sie[t].append(v)
+
+                v = solver.create_binary_var(e.name + "_page_start_ts" + str(t))
+                page_start[e][t] = v
+                sos[t].append(v)
+
+                v = solver.create_binary_var(e.name + "_page_end_ts" + str(t))
+                page_end[e][t] = v
+                soe[t].append(v)
+
+                v = solver.create_binary_var(e.name + "_live_ts" + str(t))
+                live_vars[e][t] = v
 
             if e.source in schedule_constraints:
                 ts = schedule_constraints[e.source]
@@ -312,6 +350,47 @@ class Scheduler:
                     assert ts <= ub
                     solver.add_constraint(preserve_vars[e][ts] == 1)
 
+        # For each tik, swap i/o at most one.
+        for t in sis:
+            v = solver.create_binary_var("has_prefetch_start_ts" + str(t))
+            has_sis[t] = v
+            solver.add_constraint(v == sum(sis[t]))
+        for t in sie:
+            v = solver.create_binary_var("has_prefetch_end_ts" + str(t))
+            has_sie[t] = v
+            solver.add_constraint(v == sum(sie[t]))
+        for t in sos:
+            v = solver.create_binary_var("has_page_start_ts" + str(t))
+            has_sos[t] = v
+            solver.add_constraint(v == sum(sos[t]))
+        for t in soe:
+            v = solver.create_binary_var("has_page_end_ts" + str(t))
+            has_soe[t] = v
+            solver.add_constraint(v == sum(soe[t]))
+
+        for e in self.graph.edges.values():
+            lb, ub = makespan[e]
+            # recursively define is_paging and is_prefetching
+            for t in range(lb + 1, ub + 1):
+                solver.add_constraint(is_paging[e][t] == page_start[e][t - 1] +
+                                      is_paging[e][t - 1] - page_end[e][t - 1])
+                solver.add_constraint(
+                    is_prefetching[e][t] == prefetch_start[e][t - 1] +
+                    is_prefetching[e][t - 1] - prefetch_end[e][t - 1])
+            # page only when it's there
+            for t in range(lb, ub + 1):
+                solver.add_constraint(
+                    page_start[e][t] <= preserve_vars[e][t] + generate_vars[e][t]
+                )
+            # handle live and preserve
+            for t in range(lb, ub + 1):
+                # Live is the superset of preserve
+                solver.add_constraint(preserve_vars[e][t] <= live_vars[e][t])
+                # the tensor is valid when paging
+                solver.add_constraint(is_paging[e][t] <= preserve_vars[e][t])
+                # the space is occupied when prefetching
+                solver.add_constraint(is_prefetching[e][t] <= live_vars[e][t])
+
         # Add correctness constraints: we can't preserve data unless it's been
         # generated or preserved at the previous timestep. Also it doesn't make
         # sense to preserve and compute some data at the same timestep
@@ -322,16 +401,25 @@ class Scheduler:
                     preserve_vars[e][t]
                     <= preserve_vars[e][t - 1]
                     + generate_vars[e][t - 1]
-                    + fetch_vars[e][t - 1]
+                    + prefetch_end[e][t - 1]
                 )
                 solver.add_constraint(
-                    preserve_vars[e][t] + generate_vars[e][t] + fetch_vars[e][t] <= 1
+                    preserve_vars[e][t] + generate_vars[e][t] + prefetch_end[e][t] <= 1
                 )
             # Purely to help the solver. Todo: improve the encoding to avoid
             # creating these variables in the first place
             solver.add_constraint(preserve_vars[e][lb] == 0)
             solver.add_constraint(fetch_vars[e][lb] == 0)
             solver.add_constraint(fetch_vars[e][lb + 1] == 0)
+            solver.add_constraint(prefetch_start[e][lb] == 0)
+            solver.add_constraint(prefetch_start[e][lb + 1] == 0)
+            solver.add_constraint(prefetch_end[e][lb] == 0)
+            solver.add_constraint(prefetch_end[e][lb + 1] == 0)
+            solver.add_constraint(prefetch_end[e][lb + 2] == 0)
+            solver.add_constraint(is_prefetching[e][lb] == 0)
+            solver.add_constraint(is_prefetching[e][lb + 1] == 0)
+            solver.add_constraint(is_prefetching[e][lb + 2] == 0)
+            solver.add_constraint(is_paging[e][lb] == 0)
             for t in range(alap[e.source] + 1, ub + 1):
                 solver.add_constraint(generate_vars[e][t] == 0)
 
@@ -339,6 +427,10 @@ class Scheduler:
             if e.size == 0 or not allow_swaps:
                 for t in range(lb + 2, ub + 1):
                     solver.add_constraint(fetch_vars[e][t] == 0)
+                    solver.add_constraint(prefetch_start[e][t] == 0)
+                    solver.add_constraint(prefetch_end[e][t] == 0)
+                    solver.add_constraint(page_start[e][t] == 0)
+                    solver.add_constraint(page_end[e][t] == 0)
 
             # Control edges are always available once they've been triggered.
             if e.size == 0:
@@ -378,6 +470,7 @@ class Scheduler:
         # Moreover the data must have been generated at least 2 timesteps
         # before it is fetched back, otherwise it would have been cheaper to
         # simply preserve the data in memory.
+        # TODO: maybe comment out this.
         for e in self.graph.edges.values():
             lb, ub = makespan[e]
             ub = min(ub, alap[e.source] + 1)
@@ -430,7 +523,7 @@ class Scheduler:
 
         # Memory usage at each timestep
         mem_at_timestep = defaultdict(lambda: 0)
-        for e, ts in preserve_vars.items():
+        for e, ts in live_vars.items():
             for t, v in ts.items():
                 if e.size > 0:
                     mem_at_timestep[t] += v * e.size
@@ -467,6 +560,7 @@ class Scheduler:
                 total_spills += s
             solver.add_constraint(total_spills <= max_spills)
 
+        # TODO: check below
         if account_for_fragmentation and not defrag:
             # GCD
             tensor_sizes = [t.size for t in self.graph.edges.values() if t.size > 0]
