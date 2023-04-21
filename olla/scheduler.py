@@ -1,4 +1,3 @@
-
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 # This source code is licensed under the MIT license found in the
@@ -300,10 +299,12 @@ class Scheduler:
         has_sie = {}
         has_sos = {}
         has_soe = {}
+        paging_end_size = {}
+        prefetching_end_size = {}
         sis = defaultdict(lambda: [])
-        sie = defaultdict(lambda: [])
+        sie = defaultdict(lambda: {})
         sos = defaultdict(lambda: [])
-        soe = defaultdict(lambda: [])
+        soe = defaultdict(lambda: {})
 
         for e in self.graph.edges.values():
             lb, ub = makespan[e]
@@ -320,7 +321,7 @@ class Scheduler:
 
                 v = solver.create_binary_var(e.name + "_fetch_end_ts" + str(t))
                 prefetch_end[e][t] = v
-                sie[t].append(v)
+                sie[t][e] = v
 
                 v = solver.create_binary_var(e.name + "_page_start_ts" + str(t))
                 page_start[e][t] = v
@@ -328,7 +329,7 @@ class Scheduler:
 
                 v = solver.create_binary_var(e.name + "_page_end_ts" + str(t))
                 page_end[e][t] = v
-                soe[t].append(v)
+                soe[t][e] = [v]
 
                 v = solver.create_binary_var(e.name + "_live_ts" + str(t))
                 live_vars[e][t] = v
@@ -351,6 +352,12 @@ class Scheduler:
                     solver.add_constraint(preserve_vars[e][ts] == 1)
 
         # For each tik, swap i/o at most one.
+        tensor_sizes = [t.size for t in self.graph.edges.values() if t.size > 0]
+        gcd = self._GCD(tensor_sizes)
+        # TODO: get bandwidth
+        bandwidth = 1
+        bandwidth /= gcd
+        max_tensor_size = max(tensor_sizes) // gcd
         for t in sis:
             v = solver.create_binary_var("has_prefetch_start_ts" + str(t))
             has_sis[t] = v
@@ -358,7 +365,12 @@ class Scheduler:
         for t in sie:
             v = solver.create_binary_var("has_prefetch_end_ts" + str(t))
             has_sie[t] = v
-            solver.add_constraint(v == sum(sie[t]))
+            solver.add_constraint(v == sum(sie[t].values()))
+
+            sz = solver.create_real_var("prefetch_end_size_ts" + str(t))
+            prefetching_end_size[t] = sz
+            solver.add_constraint(sz == sum(
+                [e.size // gcd * sie[t][e] / bandwidth for e in sie[t]]))
         for t in sos:
             v = solver.create_binary_var("has_page_start_ts" + str(t))
             has_sos[t] = v
@@ -366,7 +378,12 @@ class Scheduler:
         for t in soe:
             v = solver.create_binary_var("has_page_end_ts" + str(t))
             has_soe[t] = v
-            solver.add_constraint(v == sum(soe[t]))
+            solver.add_constraint(v == sum(soe[t].values()))
+
+            sz = solver.create_real_var("page_end_size_ts" + str(t))
+            paging_end_size[t] = sz
+            solver.add_constraint(sz == sum(
+                [e.size // gcd * soe[t][e] / bandwidth for e in soe[t]]))
 
         for e in self.graph.edges.values():
             lb, ub = makespan[e]
@@ -560,7 +577,6 @@ class Scheduler:
                 total_spills += s
             solver.add_constraint(total_spills <= max_spills)
 
-        # TODO: check below
         if account_for_fragmentation and not defrag:
             # GCD
             tensor_sizes = [t.size for t in self.graph.edges.values() if t.size > 0]
@@ -772,40 +788,40 @@ class Scheduler:
         #####################################################
 
         # Add objective function
-        s = 0
-        if allow_rematerialization:
-            # Minimize the number of data generations
-            for e, ts in generate_vars.items():
-                for v in ts.values():
-                    s += v * e.size
+        # s = 0
+        # if allow_rematerialization:
+        #     # Minimize the number of data generations
+        #     for e, ts in generate_vars.items():
+        #         for v in ts.values():
+        #             s += v * e.size
 
-        if max_spills is None:
-            # Minimize the number of spills
-            for e, ts in fetch_vars.items():
-                for v in ts.values():
-                    s += v * e.size * 2
-        else:
-            # Minimize peak memory usage
-            if defrag:
-                v = solver.create_integer_var(
-                    "peak_memory_usage",
-                    lower_bound=min_memory_requirement,
-                    upper_bound=mem_limit,
-                )
-                s += v
-                for t, p in addresses.items():
-                    for a in p.values():
-                        solver.add_constraint(v >= a * gcd + t.size)
-            elif account_for_fragmentation:
-                v = solver.create_integer_var(
-                    "peak_memory_usage",
-                    lower_bound=min_memory_requirement,
-                    upper_bound=mem_limit,
-                )
-                s += v
-                for t, a in addresses.items():
-                    solver.add_constraint(v >= a * gcd + t.size)
-            else:
+        # if max_spills is None:
+        #     # Minimize the number of spills
+        #     for e, ts in fetch_vars.items():
+        #         for v in ts.values():
+        #             s += v * e.size * 2
+        # else:
+        #     # Minimize peak memory usage
+        #     if defrag:
+        #         v = solver.create_integer_var(
+        #             "peak_memory_usage",
+        #             lower_bound=min_memory_requirement,
+        #             upper_bound=mem_limit,
+        #         )
+        #         s += v
+        #         for t, p in addresses.items():
+        #             for a in p.values():
+        #                 solver.add_constraint(v >= a * gcd + t.size)
+        #     elif account_for_fragmentation:
+        #         v = solver.create_integer_var(
+        #             "peak_memory_usage",
+        #             lower_bound=min_memory_requirement,
+        #             upper_bound=mem_limit,
+        #         )
+        #         s += v
+        #         for t, a in addresses.items():
+        #             solver.add_constraint(v >= a * gcd + t.size)
+        #     else:
                 v = solver.create_integer_var(
                     "peak_memory_usage",
                     lower_bound=min_memory_requirement,
@@ -815,7 +831,77 @@ class Scheduler:
                 for m in mem_at_timestep.values():
                     solver.add_constraint(v >= m)
 
-        solver.set_objective_function(s, maximize=False)
+        # Compute cost constraint
+        # TODO: write it
+        estimate_compute_cost = lambda x: 1
+
+        compute_cost_t = [
+            solver.create_real_var("compute_cost_at_ts" + str(tik),
+                                   lower_bound=0)
+            for tik in range(self.num_timesteps)
+        ]
+        for e in generate_vars:
+            edge_cost = estimate_compute_cost(e.source)
+            ts = generate_vars[e]
+            for t in ts:
+                solver.add_constraint(compute_cost_t >= ts * edge_cost)
+        # objective function
+        est_time = []
+        for tik in range(self.num_timesteps):
+            prev_time = est_time[-1]
+            cur_time = solver.create_real_var(
+                "time_at_ts" + str(tik),
+                lower_bound=0,
+                upper_bound=mem_limit,
+            )
+            solver.add_constraint(cur_time >= prev_time + compute_cost_t[tik])
+            est_time.append(cur_time)
+
+        # Swap cost
+        def exact_and_constraint(x, y, z):
+            """add constraint for x and y == z"""
+            solver.add_constraint(z <= x)
+            solver.add_constraint(z <= y)
+            solver.add_constraint(z >= x + y - 1)
+        for tik in range(self.num_timesteps):
+            for tok in range(tik + 1, self.num_timesteps):
+                # Prefetching
+                prefetch_cost = solver.create_real_var(
+                    "prefetch_cost" + str(tik) + "-" + str(tok),
+                    lower_bound=0,
+                    upper_bound=max_tensor_size)
+                has_prefetch = solver.create_binary_var("has_prefetch_ts" +
+                                                        str(tik) + "-" +
+                                                        str(tok))
+                exact_and_constraint(has_sis[tik], has_sie[tok], has_prefetch)
+                solver.add_constraint(
+                    prefetch_cost >= prefetching_end_size[tok] -
+                    (1 - has_prefetch) * max_tensor_size)
+                # The solver tends to minimize prefetch_cost, so comment it out.
+                # Likewise for paging
+                # solver.add_constraint(
+                #     prefetch_cost <= prefetching_end_size[tok] +
+                #     (1 - has_prefetch) * max_tensor_size)
+                # solver.add_constraint(
+                #     prefetch_cost <= has_prefetch * max_tensor_size)
+                solver.add_constraint(
+                    est_time[tok] >= est_time[tik] + prefetch_cost)
+                # Paging
+                page_cost = solver.create_real_var("page_cost" + str(tik) +
+                                                   "-" + str(tok),
+                                                   lower_bound=0,
+                                                   upper_bound=max_tensor_size)
+                has_page = solver.create_binary_var("has_page_ts" +
+                                                        str(tik) + "-" +
+                                                        str(tok))
+                exact_and_constraint(has_sos[tik], has_soe[tok], has_page)
+                solver.add_constraint(
+                    page_cost >= paging_end_size[tok] -
+                    (1 - has_page) * max_tensor_size)
+                solver.add_constraint(
+                    est_time[tok] >= est_time[tik] + page_cost)
+
+        solver.set_objective_function(est_time[-1], maximize=False)
 
         start_time = time.time()
         print("Start ILP solve")
