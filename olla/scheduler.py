@@ -822,14 +822,14 @@ class Scheduler:
         #         for t, a in addresses.items():
         #             solver.add_constraint(v >= a * gcd + t.size)
         #     else:
-                v = solver.create_integer_var(
-                    "peak_memory_usage",
-                    lower_bound=min_memory_requirement,
-                    upper_bound=mem_limit,
-                )
-                s += v
-                for m in mem_at_timestep.values():
-                    solver.add_constraint(v >= m)
+        #         v = solver.create_integer_var(
+        #             "peak_memory_usage",
+        #             lower_bound=min_memory_requirement,
+        #             upper_bound=mem_limit,
+        #         )
+        #         s += v
+        #         for m in mem_at_timestep.values():
+        #             solver.add_constraint(v >= m)
 
         # Compute cost constraint
         # TODO: write it
