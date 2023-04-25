@@ -1,4 +1,3 @@
-
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 # This source code is licensed under the MIT license found in the
@@ -232,15 +231,6 @@ class Scheduler:
             if index not in self.sparse_map:
                 return 0
             return self.sparse_map[index]
-        
-    class DenseGenerateOrFetchVarsMap:
-        def __init__(self, sparse_map):
-            self.sparse_map = sparse_map
-
-        def __getitem__(self, index):
-            if index not in self.sparse_map:
-                return 0
-            return self.sparse_map[index]
 
     def ComputeMinimumMemoryRequired(self):
         min_memory_requirement = 0
@@ -270,7 +260,11 @@ class Scheduler:
     #   corresponds to the peak_memory_usage plus space wasted due to
     #   fragmentation
 
-    def ComputeOptimalSwapSchedule(self, mem_limit, defrag=False):
+    def ComputeOptimalSwapSchedule(self,
+                                   mem_limit,
+                                   eval_compute_cost=None,
+                                   bandwidth=1,
+                                   defrag=False):
         account_for_fragmentation = True
         # Compute the minimum amount of memory required to run the graph.
         min_memory_requirement, bottleneck_node = self.ComputeMinimumMemoryRequired()
@@ -282,7 +276,7 @@ class Scheduler:
             )
 
         schedule_constraints = {}
-        
+
         num_timesteps = self.num_nodes
 
         if self.timestep_factor < 1 and self.longest_path_length > num_timesteps:
@@ -636,7 +630,7 @@ class Scheduler:
 
         compute_node = defaultdict(lambda: 0)
         compute_costs = defaultdict(lambda: 0)
-        eval_compute_cost = lambda node: 1
+        eval_compute_cost = eval_compute_cost or (lambda node: 1)
         # Exclusive compute
         min_time_step = num_timesteps
         max_time_step = 0
@@ -757,14 +751,13 @@ class Scheduler:
         # TODO: support defrag
         elif defrag:
             raise NotImplementedError()
-        
+
         else:
             raise NotImplementedError()
         #####################################################
 
         # Add objective function
         time_cost = defaultdict(lambda: 0)
-        bandwidth = 1
         # Compute cost
         for t in range(1, num_timesteps + 1):
             v = solver.create_real_var(f"time_@{t}")
@@ -817,7 +810,30 @@ class Scheduler:
                             f" Var {var.varName} changed: relaxed value {relaxed_solution[var.varName]} vs integral value {value}"
                         )
 
-        # TODO: check below
+        compute_schedule = {}
+        prefetch_start_schedule = defaultdict(lambda: None)
+        prefetch_end_schedule = defaultdict(lambda: None)
+        offload_start_schedule = defaultdict(lambda: None)
+        offload_end_schedule = defaultdict(lambda: None)
+        for n, ts in generate_node_vars.items():
+            generated = False
+            for t, v in ts.items():
+                if result[v] >= 0.99:
+                    assert not generated, "No Remat is supported"
+                    assert t not in compute_schedule, "No Concurrent Compute is supported"
+                    compute_schedule[t] = n
+        def record_val_to(variables, vals):
+            for e, ts in variables.items():
+                for t, v in ts.items():
+                    if result[v] >= 0.99:
+                        assert vals[t] is None
+                        vals[t] = e
+        record_val_to(prefetch_start_vars, prefetch_start_schedule)
+        record_val_to(prefetch_end_vars, prefetch_end_schedule)
+        record_val_to(offload_start_vars, offload_start_schedule)
+        record_val_to(offload_end_vars, offload_end_schedule)
+        return compute_schedule, prefetch_start_schedule, prefetch_end_schedule, offload_start_schedule, offload_end_schedule
+
         last_uses = {}
         for e in self.graph.edges.values():
             last_use = 0
