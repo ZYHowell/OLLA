@@ -1,4 +1,3 @@
-
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 # This source code is licensed under the MIT license found in the
@@ -260,6 +259,747 @@ class Scheduler:
     #   required_memory: total amount of memory needed to run the model. This
     #   corresponds to the peak_memory_usage plus space wasted due to
     #   fragmentation
+
+    def ComputeOptimalSwapSchedule(self,
+                                   mem_limit,
+                                   eval_compute_cost=None,
+                                   bandwidth=1,
+                                   defrag=False):
+        account_for_fragmentation = True
+        # Compute the minimum amount of memory required to run the graph.
+        min_memory_requirement, bottleneck_node = self.ComputeMinimumMemoryRequired()
+        min_memory_requirement_acurate = False
+        if min_memory_requirement > mem_limit:
+            raise ValueError(
+                "The graph requires at least %d bytes to run due to node %s (limit: %d)"
+                % (min_memory_requirement, bottleneck_node.name, mem_limit)
+            )
+
+        schedule_constraints = {}
+
+        num_timesteps = self.num_nodes
+
+        if self.timestep_factor < 1 and self.longest_path_length > num_timesteps:
+            # Make sure we have enough timesteps to run the longest path
+            logger.info(
+                f"Adjusting num_timesteps to {self.longest_path_length} to ensure there are enough steps to run the longest path"
+            )
+            num_timesteps = self.longest_path_length
+
+        # Compute the range of times during which each tensor can be alive, based
+        # purely on precedence constraints.
+        asap = self.ComputeASAPSchedule(schedule_constraints)
+        alap = self.ComputeALAPSchedule(schedule_constraints, num_timesteps)
+        makespan = self.ComputeMakespans(asap, alap)
+
+        spans = (makespan, asap, alap)
+
+        # GCD
+        tensor_sizes = [t.size for t in self.graph.edges.values() if t.size > 0]
+        gcd = self._GCD(tensor_sizes)
+        max_address = min(self.ComputeMaximumMemoryRequired(), mem_limit) // gcd
+
+        int_feas_tol = min(1e-5, 1.0 / max_address)
+        int_feas_tol = max(1e-9, int_feas_tol)
+        if 1.0 / max_address > 1e-5:
+            logger.info(f"Tightened IntFeasTol to {int_feas_tol}")
+
+        solver = ilp_solver.ILPSolver(
+            timeout_s=self.timeout,
+            rel_stop=self.rel_stop,
+            solver=self.solver,
+            int_feas_tol=int_feas_tol,
+            extra_params={"MIPFocus": 1},
+        )
+
+        # Create 2 new variable for each tensor and timestep: generate and preserve
+        generate_vars = defaultdict(lambda: {})
+        preserve_vars = defaultdict(lambda: {})
+        ready_vars = defaultdict(lambda: {})
+        prefetch_start_vars = defaultdict(lambda: {})
+        prefetch_end_vars = defaultdict(lambda: {})
+        offload_start_vars = defaultdict(lambda: {})
+        offload_end_vars = defaultdict(lambda: {})
+        generate_node_vars = defaultdict(lambda: {})
+        offloading_vars = defaultdict(lambda: {})
+        prefetching_vars = defaultdict(lambda: {})
+
+        for n in self.graph.nodes.values():
+            for t in self.TimeStepsForNode(n, spans):
+                v = solver.create_binary_var(n.name + "_node_generate_ts" + str(t))
+                generate_node_vars[e][t] = v
+
+        # Ready is preserved, Prefetching is preserved, Offloading is ready
+        for e in self.graph.edges.values():
+            lb, ub = makespan[e]
+            for t in self.TimeStepsForEdge(e, spans):
+                v = solver.create_binary_var(e.name + "_generate_ts" + str(t))
+                generate_vars[e][t] = v
+                v = solver.create_binary_var(e.name + "_preserve_ts" + str(t))
+                preserve_vars[e][t] = v
+                v = solver.create_binary_var(e.name + "_ready_ts" + str(t))
+                ready_vars[e][t] = v
+                v = solver.create_binary_var(e.name + "_prefetch_start_ts" + str(t))
+                prefetch_start_vars[e][t] = v
+                v = solver.create_binary_var(e.name + "_prefetch_end_ts" + str(t))
+                prefetch_end_vars[e][t] = v
+                v = solver.create_binary_var(e.name + "_offload_start_ts" + str(t))
+                offload_start_vars[e][t] = v
+                v = solver.create_binary_var(e.name + "_offload_end_ts" + str(t))
+                offload_end_vars[e][t] = v
+                v = solver.create_binary_var(e.name + "_prefetching_ts" + str(t))
+                prefetching_vars[e][t] = v
+                v = solver.create_binary_var(e.name + "_offloading_ts" + str(t))
+                offloading_vars[e][t] = v
+                solver.add_constraint(
+                    ready_vars[e][t] <= preserve_vars[e][t],
+                    name=f"{utils.get_linenumber()}_{e.name}_ready_is_preserve@{t}"
+                )
+                solver.add_constraint(
+                    offloading_vars[e][t] <= ready_vars[e][t],
+                    name=f"{utils.get_linenumber()}_{e.name}_offloading_is_ready@{t}"
+                )
+                solver.add_constraint(
+                    prefetching_vars[e][t] <= preserve_vars[e][t],
+                    name=f"{utils.get_linenumber()}_{e.name}_prefetching_is_preserve@{t}"
+                )
+
+        # Iteratively define Ready, Prefetching, and Offloading.
+        # Also define the init value
+        # Also prune to help solver: not gen after alap[src], not swap control
+        # edges, control edges always ready after gen
+        # Add correctness constraints: we can't preserve data unless it's been
+        # generated or preserved at the previous timestep. Also it doesn't make
+        # sense to preserve and compute same data at the same timestep
+        for e in self.graph.edges.values():
+            prev = self.TimeStepsForEdge(e, spans)
+            cur = self.TimeStepsForEdge(e, spans, startoffset=1)
+            for t in cur:
+                p = prev.__next__()
+
+                solver.add_constraint(
+                    ready_vars[e][t]
+                    <= ready_vars[e][p] + generate_vars[e][p] + prefetch_end_vars[e][p],
+                    name=f"{utils.get_linenumber()}_{e.name}_precedence@{t}",
+                )
+                solver.add_constraint(
+                    ready_vars[e][t] + generate_vars[e][t] + prefetch_end_vars[e][t] <= 1,
+                    name=f"{utils.get_linenumber()}_{e.name}_at_most_one@{t}",
+                )
+                solver.add_constraint(
+                    prefetching_vars[e][t] == prefetching_vars[e][p] + prefetch_start_vars[e][p] - prefetch_end_vars[e][p],
+                    name=f"{utils.get_linenumber()}_{e.name}_prefetching@{t}"
+                )
+                solver.add_constraint(
+                    offloading_vars[e][t] == offloading_vars[e][p] + offload_start_vars[e][p] - offload_end_vars[e][p],
+                    name=f"{utils.get_linenumber()}_{e.name}_offloading@{t}"
+                )
+
+            # Purely to help the solver. Todo: improve the encoding to avoid
+            # creating these variables in the first place
+            lb, _ = makespan[e]
+            # FIXME: check if stateful(param) should be always ready
+            solver.add_constraint(
+                ready_vars[e][lb] == 0,
+                name=f"{utils.get_linenumber()}_{e.name}_initially_unready@{lb}",
+            )
+
+            solver.add_constraint(
+                preserve_vars[e][lb] == 0,
+                name=f"{utils.get_linenumber()}_{e.name}_preserve_var@{lb}",
+            )
+            solver.add_constraint(
+                ready_vars[e][lb] == 0,
+                name=f"{utils.get_linenumber()}_{e.name}_preserve_var@{lb}",
+            )
+            solver.add_constraint(
+                prefetch_start_vars[e][lb] == 0,
+                name=f"{utils.get_linenumber()}_{e.name}_prefetch_start_var@{lb}",
+            )
+            solver.add_constraint(
+                prefetch_end_vars[e][lb] == 0,
+                name=f"{utils.get_linenumber()}_{e.name}_prefetch_end_var@{lb}",
+            )
+            solver.add_constraint(
+                offload_start_vars[e][lb] == 0,
+                name=f"{utils.get_linenumber()}_{e.name}_offload_start_var@{lb}",
+            )
+            solver.add_constraint(
+                offload_end_vars[e][lb] == 0,
+                name=f"{utils.get_linenumber()}_{e.name}_offload_end_var@{lb}",
+            )
+            solver.add_constraint(
+                prefetching_vars[e][lb] == 0,
+                name=f"{utils.get_linenumber()}_{e.name}_prefetching@{lb}",
+            )
+            solver.add_constraint(
+                offloading_vars[e][lb] == 0,
+                name=f"{utils.get_linenumber()}_{e.name}_offloading@{lb}",
+            )
+            if lb + 1 in prefetch_start_vars[e]:
+                solver.add_constraint(
+                    prefetch_start_vars[e][lb + 1] == 0,
+                    name=f"{utils.get_linenumber()}_{e.name}_prefetch_start_var@{lb+1}",
+                )
+            if lb + 1 in prefetch_end_vars[e]:
+                solver.add_constraint(
+                    prefetch_end_vars[e][lb + 1] == 0,
+                    name=f"{utils.get_linenumber()}_{e.name}_prefetch_end_var@{lb+1}",
+                )
+            if lb + 2 in prefetch_end_vars[e]:
+                solver.add_constraint(
+                    prefetch_end_vars[e][lb + 2] == 0,
+                    name=f"{utils.get_linenumber()}_{e.name}_prefetch_end_var@{lb+2}",
+                )
+            if lb + 1 in offload_start_vars[e]:
+                solver.add_constraint(
+                    offload_start_vars[e][lb + 1] == 0,
+                    name=f"{utils.get_linenumber()}_{e.name}_offload_start_var@{lb+1}",
+                )
+            if lb + 1 in offload_end_vars[e]:
+                solver.add_constraint(
+                    offload_end_vars[e][lb + 1] == 0,
+                    name=f"{utils.get_linenumber()}_{e.name}_offload_end_var@{lb+1}",
+                )
+            if lb + 2 in offload_end_vars[e]:
+                solver.add_constraint(
+                    offload_end_vars[e][lb + 2] == 0,
+                    name=f"{utils.get_linenumber()}_{e.name}_offload_end_var@{lb+2}",
+                )
+            for t in self.TimeStepsForEdge(e, spans):
+                if t > alap[e.source]:
+                    # if not allow_rematerialization or e.is_stateful():
+                    solver.add_constraint(
+                        generate_vars[e][t] == 0,
+                        name=f"{utils.get_linenumber()}_{e.name}_generate_var_past_alap@{t}",
+                    )
+
+            # Purely to help the solver: there is no need to swap the control edges.
+            if e.size == 0:
+                for t in self.TimeStepsForEdge(e, spans):
+                    solver.add_constraint(
+                        prefetch_start_vars[e][t] == 0,
+                        name=f"{utils.get_linenumber()}_{e.name}_prefetch_start_var@{t}",
+                    )
+                    solver.add_constraint(
+                        prefetch_end_vars[e][t] == 0,
+                        name=f"{utils.get_linenumber()}_{e.name}_prefetch_end_var@{t}",
+                    )
+                    solver.add_constraint(
+                        offload_start_vars[e][t] == 0,
+                        name=f"{utils.get_linenumber()}_{e.name}_offload_start_var@{t}",
+                    )
+                    solver.add_constraint(
+                        offload_end_vars[e][t] == 0,
+                        name=f"{utils.get_linenumber()}_{e.name}_offload_end_var@{t}",
+                    )
+
+            # Control edges are always available once they've been triggered.
+            if e.size == 0:
+                prev = self.TimeStepsForEdge(e, spans)
+                for t in self.TimeStepsForEdge(e, spans, startoffset=1):
+                    p = prev.__next__()
+                    if t <= alap[e.source]:
+                        solver.add_constraint(
+                            ready_vars[e][t]
+                            >= ready_vars[e][p] + generate_vars[e][p],
+                            name=f"{utils.get_linenumber()}_{e.name}_ctrl_edge@{t}",
+                        )
+                    else:
+                        # The source node has been run at this point.
+                        solver.add_constraint(
+                            ready_vars[e][t] == 1,
+                            name=f"{utils.get_linenumber()}_{e.name}_ready_var@{t}",
+                        )
+
+        # Gen var == gen output tensors
+        # Gen vars <= ready input tensors
+        # Add precedence constraints: we need all the nodes inputs to be
+        # available in memory at time t in order to evaluate the node.
+        # We also ensure that all the fanouts of a node are generated at the
+        # same time. This is only an optimization, since the objective of
+        # minimizing the number of computation would take care of that on its on.
+        for n in self.graph.nodes.values():
+            if len(n.fanout) > 0:
+                for v in n.fanout:
+                    for t in self.TimeStepsForNode(n, spans):
+                        solver.add_constraint(
+                            generate_node_vars[n][t]
+                            == generate_vars[v][t],
+                            name=f"{utils.get_linenumber()}_{n.name}_all_fanouts_generated@{t}",
+                        )
+
+            for src in n.fanin:
+                # Add precedence constraints
+                for t in self.TimeStepsForNode(n, spans):
+                    solver.add_constraint(
+                        generate_vars[n][t] <= ready_vars[src][t],
+                        name=f"{utils.get_linenumber()}_{n.name}_{src.name}_precedence@{t}",
+                    )
+
+        # Prefetch only after offload, or is a parameter; Parameter nvr offload
+        # We can't swap the data back in unless it's already been generated
+        # (and implicitely swapped out instead of being simply discarded).
+        for e in self.graph.edges.values():
+            if e.size == 0:
+                continue
+            if e.is_stateful():
+                # This is a parameter, we can assume there is already a copy in
+                # cpu. It does not need to be offloaded and can be prefetched
+                # from anywhere
+                for t in offload_start_vars[e]:
+                    solver.add_constraint(
+                        offload_start_vars[e][t] == 0,
+                        name=f"{utils.get_linenumber()}_{e.name}_no_need_to_offload@{t}")
+                    solver.add_constraint(
+                        offload_end_vars[e][t] == 0,
+                        name=f"{utils.get_linenumber()}_{e.name}_no_need_to_offload@{t}")
+                continue
+            cur = self.TimeStepsForEdge(e, spans)
+            try:
+                p = cur.__next__()
+                offloaded = offload_end_vars[e][p]
+                for t in cur:
+                    if t > alap[e.source]:
+                        break
+                    solver.add_constraint(
+                        prefetch_start_vars[e][t] <= offloaded,
+                        name=f"{utils.get_linenumber()}_{e.name}_fetchable@{t}",
+                    )
+                    offloaded += generate_vars[e][t]
+                    p = t
+            except StopIteration:
+                pass
+
+        # Force the generation of each tensor at least once (or exactly once if
+        # rematerialization is not allowed)
+        # TODO: use the out-var-is-ready instead.
+        for n, ts in generate_node_vars.items():
+            s = 0
+            for v in ts.values():
+                s += v
+            solver.add_constraint(
+                1 == s,
+                name=f"{utils.get_linenumber()}_{n.name}_materialized_once",
+            )
+
+        persistent_weight_size = 0
+        for e in self.graph.edges.values():
+            if e.is_stateful():
+                persistent_weight_size += e.size
+
+        prefetching = defaultdict(lambda: 0)
+        offloading = defaultdict(lambda: 0)
+        has_prefetch_start = defaultdict(lambda: 0)
+        has_prefetch_end = defaultdict(lambda: 0)
+        has_offload_start = defaultdict(lambda: 0)
+        has_offload_end = defaultdict(lambda: 0)
+        prefetch_end_size = defaultdict(lambda: 0)
+        offload_end_size = defaultdict(lambda: 0)
+
+        for e in self.graph.edges.values():
+            for t in prefetching_vars[e]:
+                prefetching[t] += prefetching_vars[e][t]
+            for t in offloading_vars[e]:
+                offloading[t] += offloading_vars[e][t]
+            for t in prefetch_start_vars[e]:
+                has_prefetch_start[t] += prefetch_start_vars[e][t]
+            for t in prefetch_end_vars[e]:
+                v = prefetch_end_vars[e][t]
+                has_prefetch_end[t] += v
+                prefetch_end_size[t] += v * (e.size // gcd)
+            for t in offload_start_vars[e]:
+                has_offload_start[t] += offload_start_vars[e][t]
+            for t in offload_end_vars[e]:
+                v = offload_end_vars[e][t]
+                has_offload_end[t] += v
+                offload_end_size[t] += v * (e.size // gcd)
+        # Exclusive prefetching
+        for t in prefetching:
+            solver.add_constraint(
+                prefetching[t] <= 1,
+                name=f"{utils.get_linenumber()}_exclusive_prefetching@{t}"
+            )
+
+        # Exclusive offloading
+        for t in offloading:
+            solver.add_constraint(
+                offloading[t] <= 1,
+                name=f"{utils.get_linenumber()}_exclusive_offloading@{t}"
+            )
+
+        compute_node = defaultdict(lambda: 0)
+        compute_costs = defaultdict(lambda: 0)
+        eval_compute_cost = eval_compute_cost or (lambda node: 1)
+        # Exclusive compute
+        min_time_step = num_timesteps
+        max_time_step = 0
+        for n in generate_node_vars:
+            for t in generate_node_vars[n]:
+                compute_node[t] += n
+                compute_costs[t] += eval_compute_cost(n) * generate_node_vars[n][t]
+                max_time_step = max(max_time_step, t)
+                min_time_step = min(min_time_step, t - 1)
+        assert max_time_step == num_timesteps
+        assert min_time_step == 0
+        for t in compute_node:
+            solver.add_constraint(
+                compute_node[t] <= 1,
+                name=f"{utils.get_linenumber()}_exclusive_offloading@{t}"
+            )
+
+        # Memory constraints: live together should be either a before b or reversed
+        if account_for_fragmentation and not defrag:
+            max_address = (mem_limit - persistent_weight_size) // gcd
+
+            # Create a new variable for each tensor that tracks the base address
+            # of the tensor. If the tensor is of size 0, we force its address to be
+            # 0 to help the solver
+            addresses = OrderedDict()
+            for tensor in self.graph.edges.values():
+                if tensor.size > 0:
+                    v = solver.create_integer_var(
+                        tensor.name,
+                        lower_bound=0,
+                        upper_bound=max_address - tensor.size // gcd,
+                    )
+                    addresses[tensor] = v
+
+            processed = set()
+            for t1, span1 in makespan.items():
+                if t1.size == 0:
+                    continue
+                # Help the solver by providing upper bounds for all the addresses
+                # solver.add_constraint(addresses[t1] + t1.size // gcd <= max_address)
+                for t2, span2 in makespan.items():
+                    if t2.size == 0:
+                        continue
+                    if t1 is t2 or (t2, t1) in processed:
+                        continue
+                    processed.add((t1, t2))
+                    if (
+                        span1[1] < span2[0]
+                        or span1[0] > span2[1]
+                        or not self.graph.can_overlap_in_time(t1, t2)
+                    ):
+                        logger.debug(t1.name + " and " + t2.name + "CANNOT OVERLAP")
+                        continue
+
+                    live_together = self.graph.are_connected_by_node(t1, t2)
+
+                    if live_together:
+                        v = solver.create_binary_var(
+                            name=f"{utils.get_linenumber()}_{t1.name}_below_{t2.name}"
+                        )
+                        solver.add_constraint(
+                            addresses[t1] + t1.size // gcd - addresses[t2]
+                            <= (1 - v) * max_address,
+                            name=f"{utils.get_linenumber()}_force_{t1.name}_below_{t2.name}",
+                        )
+                        solver.add_constraint(
+                            addresses[t1] - addresses[t2] - t2.size // gcd
+                            >= -v * max_address,
+                            name=f"{utils.get_linenumber()}_force_{t1.name}_above_{t2.name}",
+                        )
+
+                    elif span1[1] >= span2[0] and span1[0] <= span2[1]:
+                        # The spans may overlap: if they do, one of these 2 constraints must hold:
+                        # variables[t1] + t1.size <= variables[t2]
+                        # variables[t1] >= variables[t2] + t2.size
+                        v1 = solver.create_binary_var(t1.name + "_" + t2.name + "_v1")
+                        solver.add_constraint(
+                            addresses[t1] + t1.size // gcd - addresses[t2]
+                            <= (1 - v1) * max_address,
+                            name=f"{utils.get_linenumber()}_{t1.name}_below_{t2.name}",
+                        )
+
+                        v2 = solver.create_binary_var(t1.name + "_" + t2.name + "_v2")
+                        solver.add_constraint(
+                            addresses[t1] - addresses[t2] - t2.size // gcd
+                            >= (v2 - 1) * max_address,
+                            name=f"{utils.get_linenumber()}_{t1.name}_above_{t2.name}",
+                        )
+
+                        # Let's check if that helps
+                        solver.add_constraint(v1 + v2 <= 1)
+
+                        # check if they actually do overlap
+                        generate_t1 = self.DenseGenerateOrFetchVarsMap(
+                            generate_vars[t1]
+                        )
+                        preserve_t1 = self.DensePreserveVarsMap(preserve_vars[t1])
+                        prefetch_t1 = self.DenseGenerateOrFetchVarsMap(prefetch_start_vars[t1])
+                        generate_t2 = self.DenseGenerateOrFetchVarsMap(
+                            generate_vars[t2]
+                        )
+                        preserve_t2 = self.DensePreserveVarsMap(preserve_vars[t2])
+                        prefetch_t2 = self.DenseGenerateOrFetchVarsMap(prefetch_start_vars[t2])
+
+                        for ts in range(
+                            max(span1[0], span2[0]), min(span1[1], span2[1]) + 1
+                        ):
+                            live1 = generate_t1[ts] + preserve_t1[ts] + prefetch_t1[ts]
+                            live2 = generate_t2[ts] + preserve_t2[ts] + prefetch_t2[ts]
+                            overlap_at_t = live1 + live2 - 1
+                            solver.add_constraint(
+                                v1 + v2 >= overlap_at_t,
+                                name=f"{utils.get_linenumber()}_{t1.name}_overlaps_{t2.name}@{ts}",
+                            )
+
+        #####################################################
+
+        # TODO: support defrag
+        elif defrag:
+            raise NotImplementedError()
+
+        else:
+            raise NotImplementedError()
+        #####################################################
+
+        # Add objective function
+        time_cost = defaultdict(lambda: 0)
+        # Compute cost
+        for t in range(1, num_timesteps + 1):
+            v = solver.create_real_var(f"time_@{t}")
+            solver.add_constraint(v >= time_cost[t - 1] + compute_costs[t],
+                                  f"{utils.get_linenumber()}_compute_cost@{t}")
+            time_cost[t] = v
+        # Communication cost
+        for t1 in time_cost:
+            for t2 in time_cost:
+                if t2 <= t1:
+                    continue
+                prefetch_start_end = has_prefetch_start[t1] + has_prefetch_end[t2] - 1
+                fetch_cost = prefetch_end_size[t2] / (bandwidth // gcd)
+                solver.add_constraint(
+                    time_cost[t1] + fetch_cost * prefetch_start_end <= time_cost[t2] + fetch_cost,
+                    name=f"{utils.get_linenumber()}_prefetch_cost@{t1}_to_{t2}"
+                )
+                offload_start_end = has_offload_start[t1] + has_offload_end[t2] - 1
+                offload_cost = offload_end_size[t2] / (bandwidth // gcd)
+                solver.add_constraint(
+                    time_cost[t1] + offload_cost * offload_start_end <= time_cost[t2] + offload_cost,
+                    name=f"{utils.get_linenumber()}_offload_cost@{t1}_to_{t2}"
+                )
+
+        solver.set_objective_function(time_cost[num_timesteps], maximize=False)
+
+        start_time = time.time()
+        logger.info("Start ILP solver")
+        logger.info("PROBLEM STATS = " + str(solver))
+
+        result = solver.solve()
+        logger.info(f"ILP solver time: {time.time()-start_time} seconds")
+
+        if self.print_relaxation:
+            relaxed_solution = solver.solve_relaxation()
+            logger.info("CHECKING LP RELAXATION")
+            for var, value in result.items():
+                if var.VType == "B":
+                    if abs(value - relaxed_solution[var.varName]) > 0.5:
+                        logger.debug(
+                            f" Var {var.varName} flipped: relaxed value {relaxed_solution[var.varName]} vs integral value {value}"
+                        )
+                    elif abs(value - relaxed_solution[var.varName]) > 0.05:
+                        logger.debug(
+                            f" Var {var.varName} far from relaxed value {relaxed_solution[var.varName]}: integral value {value}"
+                        )
+                else:
+                    if abs(value - relaxed_solution[var.varName]) > 0.5:
+                        logger.debug(
+                            f" Var {var.varName} changed: relaxed value {relaxed_solution[var.varName]} vs integral value {value}"
+                        )
+
+        compute_schedule = {}
+        prefetch_start_schedule = defaultdict(lambda: None)
+        prefetch_end_schedule = defaultdict(lambda: None)
+        offload_start_schedule = defaultdict(lambda: None)
+        offload_end_schedule = defaultdict(lambda: None)
+        for n, ts in generate_node_vars.items():
+            generated = False
+            for t, v in ts.items():
+                if result[v] >= 0.99:
+                    assert not generated, "No Remat is supported"
+                    assert t not in compute_schedule, "No Concurrent Compute is supported"
+                    compute_schedule[t] = n
+        def record_val_to(variables, vals):
+            for e, ts in variables.items():
+                for t, v in ts.items():
+                    if result[v] >= 0.99:
+                        assert vals[t] is None
+                        vals[t] = e
+        record_val_to(prefetch_start_vars, prefetch_start_schedule)
+        record_val_to(prefetch_end_vars, prefetch_end_schedule)
+        record_val_to(offload_start_vars, offload_start_schedule)
+        record_val_to(offload_end_vars, offload_end_schedule)
+        return compute_schedule, prefetch_start_schedule, prefetch_end_schedule, offload_start_schedule, offload_end_schedule
+
+        last_uses = {}
+        for e in self.graph.edges.values():
+            last_use = 0
+            for sink in e.sinks:
+                if len(sink.fanout) == 0:
+                    last_use = max(last_use, alap[sink])
+                else:
+                    for fanout in sink.fanout:
+                        for t, v in generate_vars[fanout].items():
+                            if result[v] >= 0.99:
+                                last_use = max(last_use, t)
+
+            last_uses[e] = last_use
+
+        schedule = defaultdict(lambda: ([], [], []))
+        mem_locations = defaultdict(lambda: {})
+        materialization_count = {}
+        for n, ts in generate_vars.items():
+            tensor_materialization_count = 0
+            for t, v in ts.items():
+                if result[v] >= 0.99:
+                    tensor_materialization_count += 1
+                    if account_for_fragmentation:
+                        if n.size == 0:
+                            schedule[n][0].append(str(t) + "[ctrl]")
+                        elif n.is_stateful() and (not spilling_allowed):
+                            schedule[n][0].append(str(t) + "[weight]")
+                        else:
+                            if defrag:
+                                schedule[n][0].append(
+                                    str(t)
+                                    + "@"
+                                    + str(int(result[addresses[n][t]] * gcd))
+                                )
+                                mem_locations[t][n] = int(result[addresses[n][t]] * gcd)
+                            else:
+                                schedule[n][0].append(
+                                    str(t) + "@" + str(int(result[addresses[n]] * gcd))
+                                )
+                                mem_locations[t][n] = int(result[addresses[n]] * gcd)
+
+                    else:
+                        schedule[n][0].append(t)
+            # Don't double count nodes with multiple outputs
+            if n.source in materialization_count:
+                assert materialization_count[n.source] == tensor_materialization_count
+            else:
+                materialization_count[n.source] = tensor_materialization_count
+
+        # Sanity check: each tensor must have been generated in the [asap, alap] window
+        # of its source node
+        for n, ts in generate_vars.items():
+            src = n.source
+            last = alap[src]
+            generated = 0
+            for t, v in ts.items():
+                if t > last:
+                    break
+                generated += result[v]
+            assert generated >= 0.99
+
+        for n, ts in preserve_vars.items():
+            if account_for_fragmentation and defrag and n.size > 0:
+                addresses_n = self.DensePreserveVarsMap(addresses[n])
+            for t, v in self.DensePreserveVarsMap(ts).items():
+                if t > last_uses[n]:
+                    continue
+                if result[v] >= 0.99:
+                    schedule[n][1].append(t)
+                    if n.size == 0:
+                        continue
+                    if n.is_stateful() and (not spilling_allowed):
+                        continue
+                    if defrag:
+                        mem_locations[t][n] = int(result[addresses_n[t]] * gcd)
+                    elif account_for_fragmentation:
+                        mem_locations[t][n] = int(result[addresses[n]] * gcd)
+
+        for n, ts in fetch_vars.items():
+            for t, v in ts.items():
+                if t > last_uses[n]:
+                    continue
+                if result[v] >= 0.99:
+                    if defrag:
+                        schedule[n][2].append(
+                            str(t) + "@" + str(int(result[addresses[n][t]] * gcd))
+                        )
+                        mem_locations[t][n] = int(result[addresses[n][t]] * gcd)
+                    else:
+                        schedule[n][2].append(t)
+                        if account_for_fragmentation:
+                            mem_locations[t][n] = int(result[addresses[n]] * gcd)
+
+        mem_at_timestep = defaultdict(lambda: 0)
+        tensors_swapped = defaultdict(lambda: 0)
+        for e, ts in preserve_vars.items():
+            for t, v in self.DensePreserveVarsMap(ts).items():
+                if t <= last_uses[e]:
+                    mem_at_timestep[t] += result[v] * e.size
+        for e, ts in generate_vars.items():
+            for t, v in ts.items():
+                if t <= last_uses[e]:
+                    mem_at_timestep[t] += result[v] * e.size
+        for e, ts in fetch_vars.items():
+            for t, v in ts.items():
+                if t > last_uses[e]:
+                    continue
+                mem_at_timestep[t] += result[v] * e.size
+                if result[v] >= 0.99:
+                    tensors_swapped[e] += 1
+
+        peak_mem_usage = 0
+        for mem_usage in mem_at_timestep.values():
+            peak_mem_usage = max(peak_mem_usage, mem_usage)
+
+        total_data_swapped = 0
+        for e, count in tensors_swapped.items():
+            total_data_swapped += (count + 1) * e.size
+
+        for n in self.graph.nodes.values():
+            if n.op_type != "stateful_node_sink":
+                continue
+            for edge in n.fanin:
+                present_at_startup = result[generate_vars[edge][1]]
+                present_at_cleanup = result[preserve_vars[edge][num_timesteps]]
+                if not present_at_startup or not present_at_cleanup:
+                    factor = 1 if edge.source.read_only else 2
+                    total_data_swapped += edge.size * factor
+
+        if defrag:
+            required_memory = 0
+            for t, p in addresses.items():
+                if t.size == 0:
+                    continue
+                elif t.is_stateful() and (not spilling_allowed):
+                    continue
+                for timestamp, a in p.items():
+                    if timestamp <= last_uses[e]:
+                        required_memory = max(required_memory, result[a] * gcd + t.size)
+            required_memory += persistent_weight_size
+
+        elif account_for_fragmentation:
+            required_memory = 0
+            for t, a in addresses.items():
+                if t.size == 0:
+                    continue
+                elif t.is_stateful() and (not spilling_allowed):
+                    continue
+                required_memory = max(required_memory, result[a] * gcd + t.size)
+            required_memory += persistent_weight_size
+
+        else:
+            required_memory = peak_mem_usage
+
+        rematerialization_count = 0
+        rematerialization_time = 0
+
+        summary = {
+            "peak_mem_usage": peak_mem_usage,
+            "total_data_swapped": total_data_swapped,
+            "required_memory": required_memory,
+            "rematerialization_count": rematerialization_count,
+            "rematerialization_time": rematerialization_time,
+        }
+        return (summary, schedule, mem_locations)
+
     def ComputeOptimalSchedule(
         self,
         mem_limit=sys.maxsize,
@@ -269,6 +1009,7 @@ class Scheduler:
         defrag=False,
         user_schedule=None,
         max_spills=None,
+        prefetch_with_mem_threshold=False,
     ):
         # Compute the minimum amount of memory required to run the graph.
         min_memory_requirement, bottleneck_node = self.ComputeMinimumMemoryRequired()
