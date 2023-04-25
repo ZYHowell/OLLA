@@ -6,15 +6,30 @@
 from collections import defaultdict
 from olla.dataflow_graph import Node, Edge, Graph
 from typing import Iterable, Optional
-
+import torch
+from torch import fx
+from torch.fx import Interpreter
+import time
 
 class Simulator:
-    def __init__(self, graph: Graph, memory_bandwidth: float = 0):
+    def __init__(self, graph: Graph, model: torch.nn.Module, fx_2_df_node_map: dict[fx.Node, Node], memory_bandwidth: float = 0):
         self.graph: Graph = graph
+        self.fx_2_df_node_map: dict[fx.Node, Node] = fx_2_df_node_map
         self.memory_bandwidth: float = memory_bandwidth
+        self.intetrepreter: Interpreter = Interpreter(model)
+
+    def _df_2_fx_node(self, node: Node) -> fx.Node:
+        for fx_node, df_node in self.fx_2_df_node_map.items():
+            if df_node == node:
+                return fx_node
+        raise ValueError(f"Node {node} not found in the graph")
 
     def _operator_time_estimation(self, node: Node) -> float:
-        return 0.0
+        fx_node: fx.Node = self._df_2_fx_node(node)
+        t_start = time.time()
+        self.intetrepreter.run(fx_node)
+        t_end = time.time()
+        return t_end - t_start
 
     def _data_transfer_time_estimation(self, edge: Edge) -> float:
         return edge.size / self.memory_bandwidth

@@ -372,12 +372,31 @@ class Benchmark:
         for orig, after in zip(outputs_orig, outputs):
             assert torch.allclose(orig, after)
 
-    def run_simulation(self, g, node_order):
-        start = time.time()
-        s = simulator.Simulator(g)
-        stop = time.time()
-        simulated_peak_mem_usage, mem_per_timestep = s.Simulate(node_order)
-        return (simulated_peak_mem_usage, stop - start)
+    # def run_simulation(self, g, node_order):
+    #     start = time.time()
+    #     s = simulator.Simulator(g)
+    #     stop = time.time()
+    #     simulated_peak_mem_usage, mem_per_timestep = s.Simulate(node_order)
+    #     return (simulated_peak_mem_usage, stop - start)
+
+    def run_simulation(self, 
+                       g, 
+                       model, 
+                       fx_2_df_map, 
+                       node_order, 
+                       swap_in_begin ,
+                       swap_in_end ,
+                       swap_out_begin,
+                       swap_out_end,
+                       memory_bandwidth):
+        # start = time.time()
+        s = simulator.Simulator(g, model, fx_2_df_map, memory_bandwidth)
+        # stop = time.time()
+        # simulated_peak_mem_usage, mem_per_timestep = s.Simulate(node_order)
+        # return (simulated_peak_mem_usage, stop - start)
+        total_time_cost, time_per_timestep = s.Simulate(node_order, swap_in_begin, swap_in_end, swap_out_begin, swap_out_end)
+        return (total_time_cost, time_per_timestep)
+
 
     def run_node_ordering(self, g, fx_graph, fx_to_df_map):
         start = time.time()
