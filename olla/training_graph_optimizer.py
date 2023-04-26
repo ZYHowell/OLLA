@@ -27,6 +27,7 @@ class Scheduler:
         print_relaxation=False,
     ):
         self.graph = graph
+        self.graph.dump("./graph")
         self.timeout = timeout_s
         self.rel_stop = rel_stop
         self.solver = solver
@@ -268,7 +269,6 @@ class Scheduler:
         account_for_fragmentation = True
         # Compute the minimum amount of memory required to run the graph.
         min_memory_requirement, bottleneck_node = self.ComputeMinimumMemoryRequired()
-        min_memory_requirement_acurate = False
         if min_memory_requirement > mem_limit:
             raise ValueError(
                 "The graph requires at least %d bytes to run due to node %s (limit: %d)"
@@ -323,21 +323,30 @@ class Scheduler:
         generate_node_vars = defaultdict(lambda: {})
         offloading_vars = defaultdict(lambda: {})
         prefetching_vars = defaultdict(lambda: {})
+        tensor_size_map = defaultdict(lambda: 0)
+        edge_steps = lambda e, offset=0: (iter(range(1 + offset, num_timesteps + 1))
+                                          if e.is_stateful() else self.
+                                          TimeStepsForEdge(e, spans, offset))
 
         for n in self.graph.nodes.values():
             if n.is_stateful():
-                span = range(num_timesteps)
-            else:
-                span = self.TimeStepsForNode(n, spans)
-            for t in span:
+                continue
+            for t in self.TimeStepsForNode(n, spans):
                 v = solver.create_binary_var(n.name + "_node_generate_ts" + str(t))
                 generate_node_vars[n][t] = v
 
         # Ready is preserved, Prefetching is preserved, Offloading is ready
         for e in self.graph.edges.values():
             lb, ub = makespan[e]
-            for t in self.TimeStepsForEdge(e, spans):
-                v = solver.create_binary_var(e.name + "_generate_ts" + str(t))
+            tensor_size_map[e] = e.size // gcd
+            print(e.name, e.size)
+            for t in edge_steps(e):
+                if e.is_stateful():
+                    # Never gen a stateful var. Only prefetch or assume ready at
+                    # entry
+                    v = 0
+                else:
+                    v = solver.create_binary_var(e.name + "_generate_ts" + str(t))
                 generate_vars[e][t] = v
                 v = solver.create_binary_var(e.name + "_preserve_ts" + str(t))
                 preserve_vars[e][t] = v
@@ -367,6 +376,14 @@ class Scheduler:
                     prefetching_vars[e][t] <= preserve_vars[e][t],
                     name=f"{utils.get_linenumber()}_{e.name}_prefetching_is_preserve@{t}",
                 )
+                solver.add_constraint(
+                    prefetch_start_vars[e][t] + prefetch_end_vars[e][t] <= 1,
+                    name=f"{utils.get_linenumber()}_{e.name}_not_immediately_prefetched{t}"
+                )
+                solver.add_constraint(
+                    offload_start_vars[e][t] + offload_end_vars[e][t] <= 1,
+                    name=f"{utils.get_linenumber()}_{e.name}_not_immediately_offloaded{t}"
+                )
 
         # Iteratively define Ready, Prefetching, and Offloading.
         # Also define the init value
@@ -376,8 +393,8 @@ class Scheduler:
         # generated or preserved at the previous timestep. Also it doesn't make
         # sense to preserve and compute same data at the same timestep
         for e in self.graph.edges.values():
-            prev = self.TimeStepsForEdge(e, spans)
-            cur = self.TimeStepsForEdge(e, spans, startoffset=1)
+            prev = edge_steps(e)
+            cur = edge_steps(e, 1)
             for t in cur:
                 p = prev.__next__()
 
@@ -409,84 +426,60 @@ class Scheduler:
             # Purely to help the solver. Todo: improve the encoding to avoid
             # creating these variables in the first place
             lb, _ = makespan[e]
-            # FIXME: check if stateful(param) should be always ready
-            solver.add_constraint(
-                ready_vars[e][lb] == 0,
-                name=f"{utils.get_linenumber()}_{e.name}_initially_unready@{lb}",
-            )
-
-            solver.add_constraint(
-                preserve_vars[e][lb] == 0,
-                name=f"{utils.get_linenumber()}_{e.name}_preserve_var@{lb}",
-            )
-            solver.add_constraint(
-                ready_vars[e][lb] == 0,
-                name=f"{utils.get_linenumber()}_{e.name}_preserve_var@{lb}",
-            )
-            solver.add_constraint(
-                prefetch_start_vars[e][lb] == 0,
-                name=f"{utils.get_linenumber()}_{e.name}_prefetch_start_var@{lb}",
-            )
             solver.add_constraint(
                 prefetch_end_vars[e][lb] == 0,
                 name=f"{utils.get_linenumber()}_{e.name}_prefetch_end_var@{lb}",
             )
             solver.add_constraint(
-                offload_start_vars[e][lb] == 0,
-                name=f"{utils.get_linenumber()}_{e.name}_offload_start_var@{lb}",
-            )
-            solver.add_constraint(
-                offload_end_vars[e][lb] == 0,
-                name=f"{utils.get_linenumber()}_{e.name}_offload_end_var@{lb}",
-            )
-            solver.add_constraint(
                 prefetching_vars[e][lb] == 0,
                 name=f"{utils.get_linenumber()}_{e.name}_prefetching@{lb}",
             )
-            solver.add_constraint(
-                offloading_vars[e][lb] == 0,
-                name=f"{utils.get_linenumber()}_{e.name}_offloading@{lb}",
-            )
-            if lb + 1 in prefetch_start_vars[e]:
+            if not e.is_stateful():
                 solver.add_constraint(
-                    prefetch_start_vars[e][lb + 1] == 0,
-                    name=f"{utils.get_linenumber()}_{e.name}_prefetch_start_var@{lb+1}",
+                    ready_vars[e][lb] == 0,
+                    name=f"{utils.get_linenumber()}_{e.name}_initial_unready@{lb}",
                 )
-            if lb + 1 in prefetch_end_vars[e]:
                 solver.add_constraint(
-                    prefetch_end_vars[e][lb + 1] == 0,
-                    name=f"{utils.get_linenumber()}_{e.name}_prefetch_end_var@{lb+1}",
+                    preserve_vars[e][lb] == 0,
+                    name=f"{utils.get_linenumber()}_{e.name}_preserve_var@{lb}",
                 )
-            if lb + 2 in prefetch_end_vars[e]:
                 solver.add_constraint(
-                    prefetch_end_vars[e][lb + 2] == 0,
-                    name=f"{utils.get_linenumber()}_{e.name}_prefetch_end_var@{lb+2}",
+                    prefetch_start_vars[e][lb] == 0,
+                    name=f"{utils.get_linenumber()}_{e.name}_prefetch_start_var@{lb}",
                 )
-            if lb + 1 in offload_start_vars[e]:
                 solver.add_constraint(
-                    offload_start_vars[e][lb + 1] == 0,
-                    name=f"{utils.get_linenumber()}_{e.name}_offload_start_var@{lb+1}",
+                    offload_end_vars[e][lb] == 0,
+                    name=f"{utils.get_linenumber()}_{e.name}_offload_end_var@{lb}",
                 )
-            if lb + 1 in offload_end_vars[e]:
                 solver.add_constraint(
-                    offload_end_vars[e][lb + 1] == 0,
-                    name=f"{utils.get_linenumber()}_{e.name}_offload_end_var@{lb+1}",
+                    offloading_vars[e][lb] == 0,
+                    name=f"{utils.get_linenumber()}_{e.name}_offloading@{lb}",
                 )
-            if lb + 2 in offload_end_vars[e]:
-                solver.add_constraint(
-                    offload_end_vars[e][lb + 2] == 0,
-                    name=f"{utils.get_linenumber()}_{e.name}_offload_end_var@{lb+2}",
-                )
-            for t in self.TimeStepsForEdge(e, spans):
-                if t > alap[e.source]:
-                    # if not allow_rematerialization or e.is_stateful():
+                if lb + 1 in prefetch_start_vars[e]:
                     solver.add_constraint(
-                        generate_vars[e][t] == 0,
-                        name=f"{utils.get_linenumber()}_{e.name}_generate_var_past_alap@{t}",
+                        prefetch_start_vars[e][lb + 1] == 0,
+                        name=f"{utils.get_linenumber()}_{e.name}_prefetch_start_var@{lb+1}",
                     )
+                if lb + 1 in prefetch_end_vars[e]:
+                    solver.add_constraint(
+                        prefetch_end_vars[e][lb + 1] == 0,
+                        name=f"{utils.get_linenumber()}_{e.name}_prefetch_end_var@{lb+1}",
+                    )
+                if lb + 2 in prefetch_end_vars[e]:
+                    solver.add_constraint(
+                        prefetch_end_vars[e][lb + 2] == 0,
+                        name=f"{utils.get_linenumber()}_{e.name}_prefetch_end_var@{lb+2}",
+                    )
+                for t in self.TimeStepsForEdge(e, spans):
+                    if t > alap[e.source]:
+                        # if not allow_rematerialization or e.is_stateful():
+                        solver.add_constraint(
+                            generate_vars[e][t] == 0,
+                            name=f"{utils.get_linenumber()}_{e.name}_generate_var_past_alap@{t}",
+                        )
 
             # Purely to help the solver: there is no need to swap the control edges.
-            if e.size == 0:
+            if tensor_size_map[e] == 0:
                 for t in self.TimeStepsForEdge(e, spans):
                     solver.add_constraint(
                         prefetch_start_vars[e][t] == 0,
@@ -506,7 +499,7 @@ class Scheduler:
                     )
 
             # Control edges are always available once they've been triggered.
-            if e.size == 0:
+            if tensor_size_map[e] == 0:
                 prev = self.TimeStepsForEdge(e, spans)
                 for t in self.TimeStepsForEdge(e, spans, startoffset=1):
                     p = prev.__next__()
@@ -530,16 +523,13 @@ class Scheduler:
         # same time. This is only an optimization, since the objective of
         # minimizing the number of computation would take care of that on its on.
         for n in self.graph.nodes.values():
+            if n.is_stateful():
+                continue
             node_gen = self.DenseGenerateOrFetchVarsMap(generate_node_vars[n])
             if len(n.fanout) > 0:
                 for v in n.fanout:
-                    span = (
-                        self.TimeStepsForEdge(v, spans)
-                        if n.is_stateful()
-                        else self.TimeStepsForNode(n, spans)
-                    )
                     edge_span = self.DenseGenerateOrFetchVarsMap(generate_vars[v])
-                    for t in span:
+                    for t in generate_node_vars[n]:
                         solver.add_constraint(
                             node_gen[t] == edge_span[t],
                             name=f"{utils.get_linenumber()}_{n.name}_all_fanouts_generated@{t}",
@@ -563,7 +553,7 @@ class Scheduler:
         # We can't swap the data back in unless it's already been generated
         # (and implicitely swapped out instead of being simply discarded).
         for e in self.graph.edges.values():
-            if e.size == 0:
+            if tensor_size_map[e] == 0:
                 continue
             if e.is_stateful():
                 # This is a parameter, we can assume there is already a copy in
@@ -576,6 +566,10 @@ class Scheduler:
                     )
                     solver.add_constraint(
                         offload_end_vars[e][t] == 0,
+                        name=f"{utils.get_linenumber()}_{e.name}_no_need_to_offload@{t}",
+                    )
+                    solver.add_constraint(
+                        offloading_vars[e][t] == 0,
                         name=f"{utils.get_linenumber()}_{e.name}_no_need_to_offload@{t}",
                     )
                 continue
@@ -599,6 +593,8 @@ class Scheduler:
         # rematerialization is not allowed)
         # TODO: use the out-var-is-ready instead.
         for n, ts in generate_node_vars.items():
+            if n.is_stateful():
+                continue
             s = 0
             for v in ts.values():
                 s += v
@@ -608,9 +604,6 @@ class Scheduler:
             )
 
         persistent_weight_size = 0
-        for e in self.graph.edges.values():
-            if e.is_stateful():
-                persistent_weight_size += e.size
 
         prefetching = defaultdict(lambda: 0)
         offloading = defaultdict(lambda: 0)
@@ -631,13 +624,13 @@ class Scheduler:
             for t in prefetch_end_vars[e]:
                 v = prefetch_end_vars[e][t]
                 has_prefetch_end[t] += v
-                prefetch_end_size[t] += v * (e.size // gcd)
+                prefetch_end_size[t] += v * tensor_size_map[e]
             for t in offload_start_vars[e]:
                 has_offload_start[t] += offload_start_vars[e][t]
             for t in offload_end_vars[e]:
                 v = offload_end_vars[e][t]
                 has_offload_end[t] += v
-                offload_end_size[t] += v * (e.size // gcd)
+                offload_end_size[t] += v * tensor_size_map[e]
         # Exclusive prefetching
         for t in prefetching:
             solver.add_constraint(
@@ -686,22 +679,22 @@ class Scheduler:
             # 0 to help the solver
             addresses = OrderedDict()
             for tensor in self.graph.edges.values():
-                if tensor.size > 0:
+                if tensor_size_map[tensor] > 0:
                     v = solver.create_integer_var(
                         tensor.name,
                         lower_bound=0,
-                        upper_bound=max_address - tensor.size // gcd,
+                        upper_bound=max_address - tensor_size_map[tensor],
                     )
                     addresses[tensor] = v
 
             processed = set()
             for t1, span1 in makespan.items():
-                if t1.size == 0:
+                if tensor_size_map[t1] == 0:
                     continue
                 # Help the solver by providing upper bounds for all the addresses
                 # solver.add_constraint(addresses[t1] + t1.size // gcd <= max_address)
                 for t2, span2 in makespan.items():
-                    if t2.size == 0:
+                    if tensor_size_map[t2] == 0:
                         continue
                     if t1 is t2 or (t2, t1) in processed:
                         continue
@@ -721,12 +714,12 @@ class Scheduler:
                             name=f"{utils.get_linenumber()}_{t1.name}_below_{t2.name}"
                         )
                         solver.add_constraint(
-                            addresses[t1] + t1.size // gcd - addresses[t2]
+                            addresses[t1] + tensor_size_map[t1] - addresses[t2]
                             <= (1 - v) * max_address,
                             name=f"{utils.get_linenumber()}_force_{t1.name}_below_{t2.name}",
                         )
                         solver.add_constraint(
-                            addresses[t1] - addresses[t2] - t2.size // gcd
+                            addresses[t1] - addresses[t2] - tensor_size_map[t2]
                             >= -v * max_address,
                             name=f"{utils.get_linenumber()}_force_{t1.name}_above_{t2.name}",
                         )
@@ -737,14 +730,14 @@ class Scheduler:
                         # variables[t1] >= variables[t2] + t2.size
                         v1 = solver.create_binary_var(t1.name + "_" + t2.name + "_v1")
                         solver.add_constraint(
-                            addresses[t1] + t1.size // gcd - addresses[t2]
+                            addresses[t1] + tensor_size_map[t1] - addresses[t2]
                             <= (1 - v1) * max_address,
                             name=f"{utils.get_linenumber()}_{t1.name}_below_{t2.name}",
                         )
 
                         v2 = solver.create_binary_var(t1.name + "_" + t2.name + "_v2")
                         solver.add_constraint(
-                            addresses[t1] - addresses[t2] - t2.size // gcd
+                            addresses[t1] - addresses[t2] - tensor_size_map[t2]
                             >= (v2 - 1) * max_address,
                             name=f"{utils.get_linenumber()}_{t1.name}_above_{t2.name}",
                         )
@@ -757,22 +750,16 @@ class Scheduler:
                             generate_vars[t1]
                         )
                         preserve_t1 = self.DensePreserveVarsMap(preserve_vars[t1])
-                        prefetch_t1 = self.DenseGenerateOrFetchVarsMap(
-                            prefetch_start_vars[t1]
-                        )
                         generate_t2 = self.DenseGenerateOrFetchVarsMap(
                             generate_vars[t2]
                         )
                         preserve_t2 = self.DensePreserveVarsMap(preserve_vars[t2])
-                        prefetch_t2 = self.DenseGenerateOrFetchVarsMap(
-                            prefetch_start_vars[t2]
-                        )
 
                         for ts in range(
                             max(span1[0], span2[0]), min(span1[1], span2[1]) + 1
                         ):
-                            live1 = generate_t1[ts] + preserve_t1[ts] + prefetch_t1[ts]
-                            live2 = generate_t2[ts] + preserve_t2[ts] + prefetch_t2[ts]
+                            live1 = generate_t1[ts] + preserve_t1[ts]
+                            live2 = generate_t2[ts] + preserve_t2[ts]
                             overlap_at_t = live1 + live2 - 1
                             solver.add_constraint(
                                 v1 + v2 >= overlap_at_t,
@@ -800,8 +787,8 @@ class Scheduler:
             )
             time_cost[t] = v
         # Communication cost
-        max_fetch_size = max([e.size for e in self.graph.edges.values()])
-        max_fetch_cost = max_fetch_size * gcd / bandwidth
+        max_fetch_size = max(tensor_sizes)
+        max_fetch_cost = max_fetch_size / bandwidth
         # TODO: support max size for each tik
         for t1 in time_cost:
             for t2 in time_cost:
@@ -823,7 +810,7 @@ class Scheduler:
                 )
 
         solver.set_objective_function(time_cost[num_timesteps], maximize=False)
-        solver.write("./model.lp")
+        solver.write("./model")
 
         start_time = time.time()
         logger.info("Start ILP solver")
@@ -878,6 +865,9 @@ class Scheduler:
         record_val_to(offload_start_vars, offload_start_schedule)
         record_val_to(offload_end_vars, offload_end_schedule)
         print("compute_schedule", compute_schedule)
+        print(dict(prefetch_start_schedule))
+        print(dict(prefetch_end_schedule))
+        print(dict(offload_end_schedule))
         return (
             compute_schedule,
             prefetch_start_schedule,
