@@ -91,61 +91,26 @@ class Simulator:
         )
         return self._simulate(*out)
 
-    # def ComputeOptimalSwapSchedule(
-    #     self, mem_limit, eval_compute_cost=None, bandwidth=1, defrag=False
-    # ):
-
     def _simulate(
         self,
-        node_ordering: Iterable[Node],
-        swap_in_begin: list[Optional[Edge]],
-        swap_in_end: list[Optional[Edge]],
-        swap_out_begin: list[Optional[Edge]],
-        swap_out_end: list[Optional[Edge]],
-    ) -> tuple[int, list[tuple[Node, int]], float]:
-        # edge_ref_counts = defaultdict(lambda: 0)
-
-        # memory_used = self.graph.unused_weight_size
-        # peak_memory: float = 0.0
-        # mem_per_timestep: list[float] = []
+        node_ordering: dict[int, Node],
+        swap_in_begin: dict[int, Optional[Edge]],
+        swap_in_end: dict[int, Optional[Edge]],
+        swap_out_begin: dict[int, Optional[Edge]],
+        swap_out_end: dict[int, Optional[Edge]],
+    ) -> float:
         total_time_cost: float = 0.0
-        time_per_timestep: list[float] = []
 
         tensor_swap_in_begin_time: dict[Edge, float] = {}
         tensor_swap_out_begin_time: dict[Edge, float] = {}
 
-        # n: Node
-        # fanout: Edge
-        # for n in node_ordering:
-        #     for fanout in n.fanout:
-        #         # Record the number of references to this edge
-        #         if fanout.size > 0:
-        #             edge_ref_counts[fanout] = len(fanout.sinks)
-        #             memory_used += fanout.size
+        for ts in node_ordering.keys():
+            node = node_ordering[ts]
+            edge_in_begin = swap_in_begin[ts]
+            edge_in_end = swap_in_end[ts]
+            edge_out_begin = swap_out_begin[ts]
+            edge_out_end = swap_out_end[ts]
 
-        #     if memory_used > peak_memory:
-        #         peak_memory = memory_used
-        #     mem_per_timestep.append((n, memory_used))
-
-        #     # Free memory with no more references
-        #     for fanin in n.fanin:
-        #         if fanin.size == 0:
-        #             continue
-        #         edge_ref_counts[fanin] -= 1
-        #         assert edge_ref_counts[fanin] >= 0
-        #         if edge_ref_counts[fanin] == 0:
-        #             memory_used -= fanin.size
-
-        for (
-            i,
-            node,
-            edge_in_begin,
-            edge_in_end,
-            edge_out_begin,
-            edge_out_end,
-        ) in enumerate(
-            zip(node_ordering, swap_in_begin, swap_in_end, swap_out_begin, swap_out_end)
-        ):
             # Compute the time cost of the current timestep
             node_time: float = self._operator_time_estimation(node)
             node_end_time: float = total_time_cost + node_time
@@ -173,10 +138,6 @@ class Simulator:
                 ), "Edge not in tensor_swap_out_begin_time"
                 edge_out_end_time = tensor_swap_out_begin_time[edge_out_end] + edge_time
 
-            time_per_timestep[i] = (
-                max(node_end_time, edge_in_end_time, edge_out_end_time)
-                - total_time_cost
-            )
-            total_time_cost += time_per_timestep[i]
+            total_time_cost = max(node_end_time, edge_in_end_time, edge_out_end_time)
 
-        return total_time_cost, time_per_timestep
+        return total_time_cost
