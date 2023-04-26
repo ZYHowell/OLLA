@@ -1,4 +1,3 @@
-
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 # This source code is licensed under the MIT license found in the
@@ -29,6 +28,7 @@ from olla.torch.fx_optimizer import FXOptimizer
 KB = 2**10
 MB = 2**20
 GB = 2**30
+
 
 class Benchmark:
     def load_model(
@@ -190,16 +190,19 @@ class Benchmark:
             )
         elif model_name.startswith("opt"):
             from transformers import AutoTokenizer, OPTModel
+
             class OPTWrapper(torch.nn.Module):
                 def __init__(self):
                     super(OPTWrapper, self).__init__()
                     self.model = OPTModel.from_pretrained(f"facebook/{model_name}")
 
                 def forward(self, input_ids, attention_mask):
-                    return self.model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+                    return self.model(
+                        input_ids=input_ids, attention_mask=attention_mask
+                    ).last_hidden_state
 
             tokenizer = AutoTokenizer.from_pretrained(f"facebook/{model_name}")
-            max_seq_len = 512 # 2048
+            max_seq_len = 512  # 2048
             text = "Replace me by any text you'd like."
             # Repeat text to fill maximum sequence length of model
             text = text * (max_seq_len // len(text.split()))
@@ -210,14 +213,16 @@ class Benchmark:
         elif model_name == "gpt2":
             # TODO: Fix error when loading GPT2
             from transformers import GPT2Tokenizer, GPT2Model
+
             class GPT2Wrapper(torch.nn.Module):
                 def __init__(self):
                     super(GPT2Wrapper, self).__init__()
-                    self.model = GPT2Model.from_pretrained('gpt2')
+                    self.model = GPT2Model.from_pretrained("gpt2")
 
                 def forward(self, x):
                     return self.model(x).last_hidden_state
-            tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+
+            tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
             max_seq_len = 1024
             text = "Replace me by any text you'd like."
             # Repeat text to fill maximum sequence length of model
@@ -379,24 +384,31 @@ class Benchmark:
     #     simulated_peak_mem_usage, mem_per_timestep = s.Simulate(node_order)
     #     return (simulated_peak_mem_usage, stop - start)
 
-    def run_simulation(self, 
-                       g, 
-                       model, 
-                       fx_2_df_map, 
-                       node_order, 
-                       swap_in_begin ,
-                       swap_in_end ,
-                       swap_out_begin,
-                       swap_out_end,
-                       memory_bandwidth):
+    def run_simulation(
+        self,
+        g,
+        model,
+        fx_2_df_map,
+        node_order,
+        *args,
+        memory_bandwidth=int(1e11),
+    ):
         # start = time.time()
-        s = simulator.Simulator(g, model, fx_2_df_map, memory_bandwidth)
-        # stop = time.time()
-        # simulated_peak_mem_usage, mem_per_timestep = s.Simulate(node_order)
-        # return (simulated_peak_mem_usage, stop - start)
-        total_time_cost, time_per_timestep = s.Simulate(node_order, swap_in_begin, swap_in_end, swap_out_begin, swap_out_end)
-        return (total_time_cost, time_per_timestep)
+        s = simulator.Simulator(g, model, fx_2_df_map, *args, memory_bandwidth)
+        total_time_cost = s.default_simulate(node_order)
+        return total_time_cost
 
+    def run_schedule_simulate(
+        self,
+        g,
+        model,
+        fx_2_df_map,
+        *args,
+        memory_bandwidth=int(1e11),
+    ):
+        s = simulator.Simulator(g, model, fx_2_df_map, *args, memory_bandwidth)
+        total_time_cost = s.simulate_schedule()
+        return total_time_cost
 
     def run_node_ordering(self, g, fx_graph, fx_to_df_map):
         start = time.time()
@@ -633,7 +645,9 @@ if __name__ == "__main__":
                         infer_trace=args.verify_node_ordering,
                     )
                 except Exception as e:
-                    print(f"  FAILED TO LOAD {model}, SKIPPING TO NEXT MODEL:\n{traceback.format_exc()}")
+                    print(
+                        f"  FAILED TO LOAD {model}, SKIPPING TO NEXT MODEL:\n{traceback.format_exc()}"
+                    )
                     result["load_model.error"] = str(e).replace("\n", " ")
                     continue
 
@@ -649,228 +663,257 @@ if __name__ == "__main__":
                         "profile.max_mem_fragmentation"
                     ] = graph.max_mem_fragmentation
                     result["profile.peak_mem_usage"] = graph.peak_reserved_bytes / GB
-                    result[
-                        "profile.allocated_mem_at_peak"
-                    ] = graph.allocated_mem_at_peak / GB
+                    result["profile.allocated_mem_at_peak"] = (
+                        graph.allocated_mem_at_peak / GB
+                    )
 
                 if not args.skip_simulation:
-                    simulated_peak_mem_usage, _ = b.run_simulation(
+                    # simulated_peak_mem_usage, _ = b.run_simulation(
+                    #     graph,
+                    #     model,
+                    #     fx_to_df_map,
+                    #     pt_node_order,
+                    # )
+                    # print(
+                    #     f"  SIMULATED PEAK MEM USAGE IS {simulated_peak_mem_usage / GB:.4f} GB",
+                    #     flush=True,
+                    # )
+                    # result["simulated.peak_mem_usage"] = simulated_peak_mem_usage / GB
+                    total_time_cost = b.run_simulation(
                         graph,
+                        fx_graph,
+                        fx_to_df_map,
                         pt_node_order,
+                        *inputs,
+                        *dict(torch_model.named_parameters()).values(),
+                        *dict(torch_model.named_buffers()).values(),
                     )
-                    print(
-                        f"  SIMULATED PEAK MEM USAGE IS {simulated_peak_mem_usage / GB:.4f} GB",
-                        flush=True,
+                    print(f"  SIMULATED TOTAL TIME COST IS {total_time_cost:.4f} s")
+                    total_time_cost_optimized = b.run_schedule_simulate(
+                        graph,
+                        fx_graph,
+                        fx_to_df_map,
+                        *inputs,
+                        *dict(torch_model.named_parameters()).values(),
+                        *dict(torch_model.named_buffers()).values(),
                     )
-                    result["simulated.peak_mem_usage"] = simulated_peak_mem_usage / GB
+                    exit(1)
 
-                if args.profile_alloc_time:
-                    torch.cuda.empty_cache()
-                    runtime, alloc_count = b.measure_pt_alloc_time(pt_node_order)
-                    print(f"RAN {alloc_count} ALLOC/DEALLOC IN {runtime:.1f}s")
-                    print(
-                        f"PROFILED AVERAGE TIME IS {1e6*runtime/alloc_count} USEC PER ALLOC/DEALLOC"
-                    )
-                    result["profile.alloc_runtime"] = runtime
-                    result["profile.alloc_count"] = alloc_count
+                # if args.profile_alloc_time:
+                #     torch.cuda.empty_cache()
+                #     runtime, alloc_count = b.measure_pt_alloc_time(pt_node_order)
+                #     print(f"RAN {alloc_count} ALLOC/DEALLOC IN {runtime:.1f}s")
+                #     print(
+                #         f"PROFILED AVERAGE TIME IS {1e6*runtime/alloc_count} USEC PER ALLOC/DEALLOC"
+                #     )
+                #     result["profile.alloc_runtime"] = runtime
+                #     result["profile.alloc_count"] = alloc_count
 
-                if not args.skip_node_ordering:
-                    assert (
-                        not args.skip_simulation
-                    ), "Simulation is required to run node ordering"
-                    try:
-                        print("  PERFORM NODE REORDERING", flush=True)
-                        (
-                            peak_mem_usage,
-                            node_ordering,
-                            fx_graph_opt,
-                            solver_time,
-                        ) = b.run_node_ordering(graph, fx_graph, fx_to_df_map)
+                # if not args.skip_node_ordering:
+                #     assert (
+                #         not args.skip_simulation
+                #     ), "Simulation is required to run node ordering"
+                #     try:
+                #         print("  PERFORM NODE REORDERING", flush=True)
+                #         (
+                #             peak_mem_usage,
+                #             node_ordering,
+                #             fx_graph_opt,
+                #             solver_time,
+                #         ) = b.run_node_ordering(graph, fx_graph, fx_to_df_map)
 
-                        print(
-                            f"  REORDERED NODES IN {solver_time:.1f}s. SIMULATED PEAK MEMORY USAGE WAS {peak_mem_usage / GB:.4f} GB (SAVED {(simulated_peak_mem_usage - peak_mem_usage) / simulated_peak_mem_usage:%})",
-                            flush=True,
-                        )
+                #         print(
+                #             f"  REORDERED NODES IN {solver_time:.1f}s. SIMULATED PEAK MEMORY USAGE WAS {peak_mem_usage / GB:.4f} GB (SAVED {(simulated_peak_mem_usage - peak_mem_usage) / simulated_peak_mem_usage:%})",
+                #             flush=True,
+                #         )
 
-                        result["node_ordering.solver_time"] = solver_time
-                        result["node_ordering.peak_mem_usage"] = peak_mem_usage / GB
+                #         result["node_ordering.solver_time"] = solver_time
+                #         result["node_ordering.peak_mem_usage"] = peak_mem_usage / GB
 
-                        if args.verify_node_ordering:
-                            print("  INFER FX TRACE AFTER NODE REORDERING", flush=True)
-                            try:
-                                b.verify_fx_trace(fx_graph_opt, torch_model, outputs)
-                                result["node_ordering.verification"] = "SUCCESS"
-                            except Exception as e:
-                                print(
-                                    f"  FAILED TO VERIFY REORDERED NODES:\n{traceback.format_exc()}",
-                                    flush=True,
-                                )
-                                result["node_ordering.verification"] = "FAIL"
-                                result["node_ordering.verification.error"] = str(
-                                    e
-                                ).replace("\n", " ")
+                #         if args.verify_node_ordering:
+                #             print("  INFER FX TRACE AFTER NODE REORDERING", flush=True)
+                #             try:
+                #                 b.verify_fx_trace(fx_graph_opt, torch_model, outputs)
+                #                 result["node_ordering.verification"] = "SUCCESS"
+                #             except Exception as e:
+                #                 print(
+                #                     f"  FAILED TO VERIFY REORDERED NODES:\n{traceback.format_exc()}",
+                #                     flush=True,
+                #                 )
+                #                 result["node_ordering.verification"] = "FAIL"
+                #                 result["node_ordering.verification.error"] = str(
+                #                     e
+                #                 ).replace("\n", " ")
 
-                        if args.memory_profile_node_ordering:
-                            print(
-                                "  PROFILE FX TRACE AFTER NODE REORDERING", flush=True
-                            )
-                            try:
-                                torch.cuda.empty_cache()
-                                profiler = fx_profiler.ProfilingInterpreter(
-                                    fx_graph_opt,
-                                    profile_time=False,
-                                    profile_memory=True,
-                                    warm_up_iters=warm_up_iters,
-                                    profile_iters=profile_iters,
-                                )
-                                with torch.no_grad():
-                                    profiler.run(
-                                        *inputs,
-                                        *dict(torch_model.named_parameters()).values(),
-                                        *dict(torch_model.named_buffers()).values(),
-                                    )
-                                result["node_ordering.profile"] = "SUCCESS"
+                #         if args.memory_profile_node_ordering:
+                #             print(
+                #                 "  PROFILE FX TRACE AFTER NODE REORDERING", flush=True
+                #             )
+                #             try:
+                #                 torch.cuda.empty_cache()
+                #                 profiler = fx_profiler.ProfilingInterpreter(
+                #                     fx_graph_opt,
+                #                     profile_time=False,
+                #                     profile_memory=True,
+                #                     warm_up_iters=warm_up_iters,
+                #                     profile_iters=profile_iters,
+                #                 )
+                #                 with torch.no_grad():
+                #                     profiler.run(
+                #                         *inputs,
+                #                         *dict(torch_model.named_parameters()).values(),
+                #                         *dict(torch_model.named_buffers()).values(),
+                #                     )
+                #                 result["node_ordering.profile"] = "SUCCESS"
 
-                                print(
-                                    f"AFTER NODE ORDERING: PROFILED MAX MEMORY FRAGMENTATION IS {profiler.get_max_mem_fragmentation():%} AND PROFILED PEAK MEMORY IS {profiler.get_peak_reserved_bytes()/GB:.4f} GB, PROFILED ALLOCATED MEMORY AT PEAK IS {profiler.get_allocated_mem_at_peak()/GB:.4f} GB"
-                                )
-                                result[
-                                    "node_ordering.profile.max_mem_fragmentation"
-                                ] = profiler.max_mem_fragmentation
-                                result[
-                                    "node_ordering.profile.peak_reserved_bytes"
-                                ] = profiler.peak_reserved_bytes / GB
-                                result[
-                                    "node_ordering.profile.allocated_mem_at_peak"
-                                ] = profiler.allocated_mem_at_peak / GB
-                            except Exception as e:
-                                print(
-                                    f"  FAILED TO PROFILE REORDERED NODES:\n{traceback.format_exc()}",
-                                    flush=True,
-                                )
-                                result["node_ordering.profile"] = "FAIL"
-                                result["node_ordering.profile.error"] = str(e).replace(
-                                    "\n", " "
-                                )
+                #                 print(
+                #                     f"AFTER NODE ORDERING: PROFILED MAX MEMORY FRAGMENTATION IS {profiler.get_max_mem_fragmentation():%} AND PROFILED PEAK MEMORY IS {profiler.get_peak_reserved_bytes()/GB:.4f} GB, PROFILED ALLOCATED MEMORY AT PEAK IS {profiler.get_allocated_mem_at_peak()/GB:.4f} GB"
+                #                 )
+                #                 result[
+                #                     "node_ordering.profile.max_mem_fragmentation"
+                #                 ] = profiler.max_mem_fragmentation
+                #                 result["node_ordering.profile.peak_reserved_bytes"] = (
+                #                     profiler.peak_reserved_bytes / GB
+                #                 )
+                #                 result[
+                #                     "node_ordering.profile.allocated_mem_at_peak"
+                #                 ] = (profiler.allocated_mem_at_peak / GB)
+                #             except Exception as e:
+                #                 print(
+                #                     f"  FAILED TO PROFILE REORDERED NODES:\n{traceback.format_exc()}",
+                #                     flush=True,
+                #                 )
+                #                 result["node_ordering.profile"] = "FAIL"
+                #                 result["node_ordering.profile.error"] = str(e).replace(
+                #                     "\n", " "
+                #                 )
 
-                    except Exception as e:
-                        print(f"  FAILED TO REORDER NODES:\n{traceback.format_exc()}", flush=True)
-                        result["node_ordering.error"] = str(e).replace("\n", " ")
-                        continue
+                #     except Exception as e:
+                #         print(
+                #             f"  FAILED TO REORDER NODES:\n{traceback.format_exc()}",
+                #             flush=True,
+                #         )
+                #         result["node_ordering.error"] = str(e).replace("\n", " ")
+                #         continue
 
-                if args.generate_addresses:
-                    assert (
-                        not args.skip_simulation
-                    ), "Simulation is required to run address generation"
-                    assert (
-                        not args.skip_node_ordering
-                    ), "Node ordering is required to run address generation"
-                    try:
-                        (
-                            peak_mem_usage,
-                            fragmentation,
-                            solver_time,
-                        ) = b.run_address_generation(graph, node_ordering)
-                        print(
-                            f"  GENERATED ADDRESSES IN {solver_time:.1f}s. PEAK MEM USAGE WAS {peak_mem_usage / GB:.4f} GB, FRAGMENTATION WAS {fragmentation:%}",
-                            flush=True,
-                        )
-                        result["address_generation.solver_time"] = solver_time
-                        result["address_generation.fragmentation"] = fragmentation
-                        result["address_generation.peak_mem_usage"] = peak_mem_usage / GB
-                    except Exception as e:
-                        print(f"  FAILED TO GENERATE ADDRESSES:\n{traceback.format_exc()}", flush=True)
-                        result["address_generation.error"] = str(e).replace("\n", " ")
-                        traceback.print_exc()
+                # if args.generate_addresses:
+                #     assert (
+                #         not args.skip_simulation
+                #     ), "Simulation is required to run address generation"
+                #     assert (
+                #         not args.skip_node_ordering
+                #     ), "Node ordering is required to run address generation"
+                #     try:
+                #         (
+                #             peak_mem_usage,
+                #             fragmentation,
+                #             solver_time,
+                #         ) = b.run_address_generation(graph, node_ordering)
+                #         print(
+                #             f"  GENERATED ADDRESSES IN {solver_time:.1f}s. PEAK MEM USAGE WAS {peak_mem_usage / GB:.4f} GB, FRAGMENTATION WAS {fragmentation:%}",
+                #             flush=True,
+                #         )
+                #         result["address_generation.solver_time"] = solver_time
+                #         result["address_generation.fragmentation"] = fragmentation
+                #         result["address_generation.peak_mem_usage"] = (
+                #             peak_mem_usage / GB
+                #         )
+                #     except Exception as e:
+                #         print(
+                #             f"  FAILED TO GENERATE ADDRESSES:\n{traceback.format_exc()}",
+                #             flush=True,
+                #         )
+                #         result["address_generation.error"] = str(e).replace("\n", " ")
+                #         traceback.print_exc()
 
-                if args.rematerialization:
-                    assert (
-                        not args.skip_simulation
-                    ), "Simulation is required to run rematerialization"
-                    assert (
-                        not args.skip_node_ordering
-                    ), "Node ordering is required to run rematerialization"
-                    try:
-                        s = training_graph_optimizer.Scheduler(graph)
-                        min_memory, _ = s.ComputeMinimumMemoryRequired()
-                        for savings in [0.1, 0.25, 0.5, 0.75, 1.0]:
-                            done = False
-                            memory_budget = peak_mem_usage * (1.0 - savings)
-                            if memory_budget < min_memory:
-                                memory_budget = min_memory
-                                savings = 1.0 - memory_budget / peak_mem_usage
-                                done = True
-                            overhead, solver_time = b.run_rematerialization(
-                                graph, memory_budget
-                            )
-                            print(
-                                f"  PLANNED REMATERIALIZATION TO SAVE {savings:%} MEMORY IN {solver_time:.1f}s. INCREASED MODEL LATENCY BY {overhead:%})",
-                                flush=True,
-                            )
-                            result[
-                                f"rematerialization.savings_{savings}.overhead"
-                            ] = overhead
-                            result[
-                                f"rematerialization.savings_{savings}.solver_time"
-                            ] = solver_time
-                            if done:
-                                break
-                    except Exception as e:
-                        print(
-                            f"  FAILED TO PLAN REMATERIALIZATION TO SAVE {savings:%} MEMORY:\n{traceback.format_exc()}",
-                            flush=True,
-                        )
-                        result[f"rematerialization.savings_{savings}.error"] = str(
-                            e
-                        ).replace("\n", " ")
-                        traceback.print_exc()
+                # if args.rematerialization:
+                #     assert (
+                #         not args.skip_simulation
+                #     ), "Simulation is required to run rematerialization"
+                #     assert (
+                #         not args.skip_node_ordering
+                #     ), "Node ordering is required to run rematerialization"
+                #     try:
+                #         s = training_graph_optimizer.Scheduler(graph)
+                #         min_memory, _ = s.ComputeMinimumMemoryRequired()
+                #         for savings in [0.1, 0.25, 0.5, 0.75, 1.0]:
+                #             done = False
+                #             memory_budget = peak_mem_usage * (1.0 - savings)
+                #             if memory_budget < min_memory:
+                #                 memory_budget = min_memory
+                #                 savings = 1.0 - memory_budget / peak_mem_usage
+                #                 done = True
+                #             overhead, solver_time = b.run_rematerialization(
+                #                 graph, memory_budget
+                #             )
+                #             print(
+                #                 f"  PLANNED REMATERIALIZATION TO SAVE {savings:%} MEMORY IN {solver_time:.1f}s. INCREASED MODEL LATENCY BY {overhead:%})",
+                #                 flush=True,
+                #             )
+                #             result[
+                #                 f"rematerialization.savings_{savings}.overhead"
+                #             ] = overhead
+                #             result[
+                #                 f"rematerialization.savings_{savings}.solver_time"
+                #             ] = solver_time
+                #             if done:
+                #                 break
+                #     except Exception as e:
+                #         print(
+                #             f"  FAILED TO PLAN REMATERIALIZATION TO SAVE {savings:%} MEMORY:\n{traceback.format_exc()}",
+                #             flush=True,
+                #         )
+                #         result[f"rematerialization.savings_{savings}.error"] = str(
+                #             e
+                #         ).replace("\n", " ")
+                #         traceback.print_exc()
 
-                if args.spilling:
-                    assert (
-                        not args.skip_simulation
-                    ), "Simulation is required to run spilling"
-                    assert (
-                        not args.skip_node_ordering
-                    ), "Node ordering is required to run address spilling"
+                # if args.spilling:
+                #     assert (
+                #         not args.skip_simulation
+                #     ), "Simulation is required to run spilling"
+                #     assert (
+                #         not args.skip_node_ordering
+                #     ), "Node ordering is required to run address spilling"
 
-                    try:
-                        graph.constrain_relative_ordering(node_ordering, linearize=True)
-                        s = training_graph_optimizer.Scheduler(graph)
-                        min_memory, _ = s.ComputeMinimumMemoryRequired()
-                        for savings in [0.1, 0.25, 0.5, 0.75, 1.0]:
-                            done = False
-                            memory_budget = peak_mem_usage * (1.0 - savings)
-                            if memory_budget < min_memory:
-                                memory_budget = min_memory
-                                savings = 1.0 - memory_budget / peak_mem_usage
-                                done = True
-                            overhead, solver_time = b.run_spilling(graph, memory_budget)
-                            print(
-                                f"  PLANNED SPILLING TO SAVE {savings:%} MEMORY IN {solver_time:.1f}s. INCREASED MODEL LATENCY BY {overhead:%})",
-                                flush=True,
-                            )
-                            result[f"spilling.savings_{savings}.overhead"] = overhead
-                            result[
-                                f"spilling.savings_{savings}.solver_time"
-                            ] = solver_time
-                            if done:
-                                break
-                    except Exception as e:
-                        print(
-                            f"  FAILED TO PLAN SPILLING TO SAVE {savings:%} MEMORY:\n{traceback.format_exc()}",
-                            flush=True,
-                        )
-                        result[f"spilling.savings_{savings}.error"] = str(e).replace(
-                            "\n", " "
-                        )
-                        traceback.print_exc()
+                #     try:
+                #         graph.constrain_relative_ordering(node_ordering, linearize=True)
+                #         s = training_graph_optimizer.Scheduler(graph)
+                #         min_memory, _ = s.ComputeMinimumMemoryRequired()
+                #         for savings in [0.1, 0.25, 0.5, 0.75, 1.0]:
+                #             done = False
+                #             memory_budget = peak_mem_usage * (1.0 - savings)
+                #             if memory_budget < min_memory:
+                #                 memory_budget = min_memory
+                #                 savings = 1.0 - memory_budget / peak_mem_usage
+                #                 done = True
+                #             overhead, solver_time = b.run_spilling(graph, memory_budget)
+                #             print(
+                #                 f"  PLANNED SPILLING TO SAVE {savings:%} MEMORY IN {solver_time:.1f}s. INCREASED MODEL LATENCY BY {overhead:%})",
+                #                 flush=True,
+                #             )
+                #             result[f"spilling.savings_{savings}.overhead"] = overhead
+                #             result[
+                #                 f"spilling.savings_{savings}.solver_time"
+                #             ] = solver_time
+                #             if done:
+                #                 break
+                #     except Exception as e:
+                #         print(
+                #             f"  FAILED TO PLAN SPILLING TO SAVE {savings:%} MEMORY:\n{traceback.format_exc()}",
+                #             flush=True,
+                #         )
+                #         result[f"spilling.savings_{savings}.error"] = str(e).replace(
+                #             "\n", " "
+                #         )
+                #         traceback.print_exc()
 
-                # Log result
-                results.append(result)
-                pd.DataFrame(results).fillna("").to_csv(
-                    args.log_path,
-                    mode="a" if args.append_log else "w",
-                    header=not args.append_log,
-                    index=False,
-                    float_format="%.4g",
-                )
+                # # Log result
+                # results.append(result)
+                # pd.DataFrame(results).fillna("").to_csv(
+                #     args.log_path,
+                #     mode="a" if args.append_log else "w",
+                #     header=not args.append_log,
+                #     index=False,
+                #     float_format="%.4g",
+                # )

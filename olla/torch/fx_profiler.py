@@ -1,4 +1,3 @@
-
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 # This source code is licensed under the MIT license found in the
@@ -47,7 +46,7 @@ class ProfilingInterpreter(torch.fx.Interpreter):
     def run(self, *args) -> Any:
         # reset profile results and status variables
         self._reset()
-        torch.cuda.reset_peak_memory_stats()
+        # torch.cuda.reset_peak_memory_stats()
 
         for _ in range(self.warm_up_iters):
             # running without profiling
@@ -144,7 +143,9 @@ class ProfilingInterpreter(torch.fx.Interpreter):
         if self.table is None:
             self._generate_summary()
 
-        row = self.table.sort_values(["memory_reserved", "memory_allocated"], ascending=False).iloc[0]
+        row = self.table.sort_values(
+            ["memory_reserved", "memory_allocated"], ascending=False
+        ).iloc[0]
         self.allocated_mem_at_peak = row["memory_allocated"]
         self.peak_reserved_bytes = row["memory_reserved"]
         self.max_mem_fragmentation = (

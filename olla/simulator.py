@@ -8,8 +8,30 @@ from olla.dataflow_graph import Node, Edge, Graph
 from typing import Iterable, Optional
 import torch
 from torch import fx
-from torch.fx import Interpreter
+from olla.torch.fx_profiler import ProfilingInterpreter as Interpreter
+from olla.training_graph_optimizer import Scheduler
 import time
+
+
+# class Profiler(Interpreter):
+#     def __init__(
+#         self,
+#         gm: torch.fx.GraphModule,
+#         profile_memory: bool = True,
+#         profile_time: bool = False,
+#         warm_up_iters: int = 0,
+#         profile_iters: int = 1,
+#     ):
+#         super().__init__(gm)
+#         self.profile_memory = profile_memory
+#         self.profile_time = profile_time
+#         self.warm_up_iters = warm_up_iters
+#         self.profile_iters = profile_iters
+#         if self.profile_memory:
+#             assert (
+#                 torch.cuda.is_available()
+#             ), "Currently memory profile is only supported on CUDA"
+#         self._reset()
 
 
 class Simulator:
@@ -18,19 +40,29 @@ class Simulator:
         graph: Graph,
         model: torch.nn.Module,
         fx_2_df_node_map: dict[fx.Node, Node],
-        memory_bandwidth: float = 0,
+        *args,
+        memory_bandwidth: int = int(1e11),
     ):
         self.graph: Graph = graph
         self.fx_2_df_node_map: dict[fx.Node, Node] = fx_2_df_node_map
-        self.memory_bandwidth: float = memory_bandwidth
-        self.intetrepreter: Interpreter = Interpreter(model)
+        self.memory_bandwidth: int = memory_bandwidth
+        self.intetrepreter: Interpreter = Interpreter(model, False, True)
         self.node_run_time: dict[Node, float] = {}
 
+        self.intetrepreter.run(*args)
+
         for fx_node, df_node in self.fx_2_df_node_map.items():
-            s_time = time.time()
-            self.intetrepreter.run_node(fx_node)
-            e_time = time.time()
-            self.node_run_time[df_node] = e_time - s_time
+            try:
+                # print(fx_node.name)
+                self.intetrepreter.node_profiles[fx_node]["runtimes_sec"]
+                self.node_run_time[df_node] = sum(
+                    self.intetrepreter.node_profiles[fx_node]["runtimes_sec"]
+                ) / len(self.intetrepreter.node_profiles[fx_node]["runtimes_sec"])
+            except Exception as e:
+                # print(e)
+                # print(fx_node.name)
+                self.node_run_time[df_node] = 0
+            # print(self.node_run_time[df_node])
 
     def _df_2_fx_node(self, node: Node) -> fx.Node:
         for fx_node, df_node in self.fx_2_df_node_map.items():
@@ -50,7 +82,20 @@ class Simulator:
             total_time_cost += self.node_run_time[node]
         return total_time_cost
 
-    def Simulate(
+    def simulate_schedule(self) -> float:
+        scheduler: Scheduler = Scheduler(self.graph)
+        out = scheduler.ComputeOptimalSwapSchedule(
+            mem_limit=int(1e9),
+            eval_compute_cost=self.node_run_time,
+            bandwidth=self.memory_bandwidth,
+        )
+        return self._simulate(*out)
+
+    # def ComputeOptimalSwapSchedule(
+    #     self, mem_limit, eval_compute_cost=None, bandwidth=1, defrag=False
+    # ):
+
+    def _simulate(
         self,
         node_ordering: Iterable[Node],
         swap_in_begin: list[Optional[Edge]],

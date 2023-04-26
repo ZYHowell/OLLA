@@ -14,6 +14,8 @@ import intervaltree
 from olla import dataflow_graph, ilp_solver, utils
 
 logger = logging.getLogger(__name__)
+
+
 class Scheduler:
     def __init__(
         self,
@@ -260,11 +262,9 @@ class Scheduler:
     #   corresponds to the peak_memory_usage plus space wasted due to
     #   fragmentation
 
-    def ComputeOptimalSwapSchedule(self,
-                                   mem_limit,
-                                   eval_compute_cost=None,
-                                   bandwidth=1,
-                                   defrag=False):
+    def ComputeOptimalSwapSchedule(
+        self, mem_limit, eval_compute_cost=None, bandwidth=1, defrag=False
+    ):
         account_for_fragmentation = True
         # Compute the minimum amount of memory required to run the graph.
         min_memory_requirement, bottleneck_node = self.ComputeMinimumMemoryRequired()
@@ -325,9 +325,13 @@ class Scheduler:
         prefetching_vars = defaultdict(lambda: {})
 
         for n in self.graph.nodes.values():
-            for t in self.TimeStepsForNode(n, spans):
+            if n.is_stateful():
+                span = range(num_timesteps)
+            else:
+                span = self.TimeStepsForNode(n, spans)
+            for t in span:
                 v = solver.create_binary_var(n.name + "_node_generate_ts" + str(t))
-                generate_node_vars[e][t] = v
+                generate_node_vars[n][t] = v
 
         # Ready is preserved, Prefetching is preserved, Offloading is ready
         for e in self.graph.edges.values():
@@ -353,15 +357,15 @@ class Scheduler:
                 offloading_vars[e][t] = v
                 solver.add_constraint(
                     ready_vars[e][t] <= preserve_vars[e][t],
-                    name=f"{utils.get_linenumber()}_{e.name}_ready_is_preserve@{t}"
+                    name=f"{utils.get_linenumber()}_{e.name}_ready_is_preserve@{t}",
                 )
                 solver.add_constraint(
                     offloading_vars[e][t] <= ready_vars[e][t],
-                    name=f"{utils.get_linenumber()}_{e.name}_offloading_is_ready@{t}"
+                    name=f"{utils.get_linenumber()}_{e.name}_offloading_is_ready@{t}",
                 )
                 solver.add_constraint(
                     prefetching_vars[e][t] <= preserve_vars[e][t],
-                    name=f"{utils.get_linenumber()}_{e.name}_prefetching_is_preserve@{t}"
+                    name=f"{utils.get_linenumber()}_{e.name}_prefetching_is_preserve@{t}",
                 )
 
         # Iteratively define Ready, Prefetching, and Offloading.
@@ -383,16 +387,23 @@ class Scheduler:
                     name=f"{utils.get_linenumber()}_{e.name}_precedence@{t}",
                 )
                 solver.add_constraint(
-                    ready_vars[e][t] + generate_vars[e][t] + prefetch_end_vars[e][t] <= 1,
+                    ready_vars[e][t] + generate_vars[e][t] + prefetch_end_vars[e][t]
+                    <= 1,
                     name=f"{utils.get_linenumber()}_{e.name}_at_most_one@{t}",
                 )
                 solver.add_constraint(
-                    prefetching_vars[e][t] == prefetching_vars[e][p] + prefetch_start_vars[e][p] - prefetch_end_vars[e][p],
-                    name=f"{utils.get_linenumber()}_{e.name}_prefetching@{t}"
+                    prefetching_vars[e][t]
+                    == prefetching_vars[e][p]
+                    + prefetch_start_vars[e][p]
+                    - prefetch_end_vars[e][p],
+                    name=f"{utils.get_linenumber()}_{e.name}_prefetching@{t}",
                 )
                 solver.add_constraint(
-                    offloading_vars[e][t] == offloading_vars[e][p] + offload_start_vars[e][p] - offload_end_vars[e][p],
-                    name=f"{utils.get_linenumber()}_{e.name}_offloading@{t}"
+                    offloading_vars[e][t]
+                    == offloading_vars[e][p]
+                    + offload_start_vars[e][p]
+                    - offload_end_vars[e][p],
+                    name=f"{utils.get_linenumber()}_{e.name}_offloading@{t}",
                 )
 
             # Purely to help the solver. Todo: improve the encoding to avoid
@@ -501,8 +512,7 @@ class Scheduler:
                     p = prev.__next__()
                     if t <= alap[e.source]:
                         solver.add_constraint(
-                            ready_vars[e][t]
-                            >= ready_vars[e][p] + generate_vars[e][p],
+                            ready_vars[e][t] >= ready_vars[e][p] + generate_vars[e][p],
                             name=f"{utils.get_linenumber()}_{e.name}_ctrl_edge@{t}",
                         )
                     else:
@@ -520,20 +530,32 @@ class Scheduler:
         # same time. This is only an optimization, since the objective of
         # minimizing the number of computation would take care of that on its on.
         for n in self.graph.nodes.values():
+            node_gen = self.DenseGenerateOrFetchVarsMap(generate_node_vars[n])
             if len(n.fanout) > 0:
                 for v in n.fanout:
-                    for t in self.TimeStepsForNode(n, spans):
+                    span = (
+                        self.TimeStepsForEdge(v, spans)
+                        if n.is_stateful()
+                        else self.TimeStepsForNode(n, spans)
+                    )
+                    edge_span = self.DenseGenerateOrFetchVarsMap(generate_vars[v])
+                    for t in span:
                         solver.add_constraint(
-                            generate_node_vars[n][t]
-                            == generate_vars[v][t],
+                            node_gen[t] == edge_span[t],
                             name=f"{utils.get_linenumber()}_{n.name}_all_fanouts_generated@{t}",
                         )
 
             for src in n.fanin:
+                edge_span = self.DenseGenerateOrFetchVarsMap(ready_vars[src])
                 # Add precedence constraints
-                for t in self.TimeStepsForNode(n, spans):
+                span = (
+                    self.TimeStepsForEdge(src, spans)
+                    if n.is_stateful()
+                    else self.TimeStepsForNode(n, spans)
+                )
+                for t in span:
                     solver.add_constraint(
-                        generate_vars[n][t] <= ready_vars[src][t],
+                        node_gen[t] <= edge_span[t],
                         name=f"{utils.get_linenumber()}_{n.name}_{src.name}_precedence@{t}",
                     )
 
@@ -550,10 +572,12 @@ class Scheduler:
                 for t in offload_start_vars[e]:
                     solver.add_constraint(
                         offload_start_vars[e][t] == 0,
-                        name=f"{utils.get_linenumber()}_{e.name}_no_need_to_offload@{t}")
+                        name=f"{utils.get_linenumber()}_{e.name}_no_need_to_offload@{t}",
+                    )
                     solver.add_constraint(
                         offload_end_vars[e][t] == 0,
-                        name=f"{utils.get_linenumber()}_{e.name}_no_need_to_offload@{t}")
+                        name=f"{utils.get_linenumber()}_{e.name}_no_need_to_offload@{t}",
+                    )
                 continue
             cur = self.TimeStepsForEdge(e, spans)
             try:
@@ -618,34 +642,39 @@ class Scheduler:
         for t in prefetching:
             solver.add_constraint(
                 prefetching[t] <= 1,
-                name=f"{utils.get_linenumber()}_exclusive_prefetching@{t}"
+                name=f"{utils.get_linenumber()}_exclusive_prefetching@{t}",
             )
 
         # Exclusive offloading
         for t in offloading:
             solver.add_constraint(
                 offloading[t] <= 1,
-                name=f"{utils.get_linenumber()}_exclusive_offloading@{t}"
+                name=f"{utils.get_linenumber()}_exclusive_offloading@{t}",
             )
 
         compute_node = defaultdict(lambda: 0)
         compute_costs = defaultdict(lambda: 0)
-        eval_compute_cost = eval_compute_cost or (lambda node: 1)
+        eval_compute_cost = eval_compute_cost or defaultdict(lambda: 1)
         # Exclusive compute
         min_time_step = num_timesteps
         max_time_step = 0
         for n in generate_node_vars:
             for t in generate_node_vars[n]:
-                compute_node[t] += n
-                compute_costs[t] += eval_compute_cost(n) * generate_node_vars[n][t]
-                max_time_step = max(max_time_step, t)
-                min_time_step = min(min_time_step, t - 1)
+                compute_node[t] += generate_node_vars[n][t]
+                if n.is_stateful():
+                    node_compute_cost = 0
+                else:
+                    node_compute_cost = eval_compute_cost[n]
+                compute_costs[t] += node_compute_cost * generate_node_vars[n][t]
+                if not n.is_stateful():
+                    max_time_step = max(max_time_step, t)
+                    min_time_step = min(min_time_step, t - 1)
         assert max_time_step == num_timesteps
-        assert min_time_step == 0
+        assert min_time_step == 0, min_time_step
         for t in compute_node:
             solver.add_constraint(
                 compute_node[t] <= 1,
-                name=f"{utils.get_linenumber()}_exclusive_offloading@{t}"
+                name=f"{utils.get_linenumber()}_exclusive_offloading@{t}",
             )
 
         # Memory constraints: live together should be either a before b or reversed
@@ -728,12 +757,16 @@ class Scheduler:
                             generate_vars[t1]
                         )
                         preserve_t1 = self.DensePreserveVarsMap(preserve_vars[t1])
-                        prefetch_t1 = self.DenseGenerateOrFetchVarsMap(prefetch_start_vars[t1])
+                        prefetch_t1 = self.DenseGenerateOrFetchVarsMap(
+                            prefetch_start_vars[t1]
+                        )
                         generate_t2 = self.DenseGenerateOrFetchVarsMap(
                             generate_vars[t2]
                         )
                         preserve_t2 = self.DensePreserveVarsMap(preserve_vars[t2])
-                        prefetch_t2 = self.DenseGenerateOrFetchVarsMap(prefetch_start_vars[t2])
+                        prefetch_t2 = self.DenseGenerateOrFetchVarsMap(
+                            prefetch_start_vars[t2]
+                        )
 
                         for ts in range(
                             max(span1[0], span2[0]), min(span1[1], span2[1]) + 1
@@ -760,11 +793,16 @@ class Scheduler:
         time_cost = defaultdict(lambda: 0)
         # Compute cost
         for t in range(1, num_timesteps + 1):
-            v = solver.create_real_var(f"time_@{t}")
-            solver.add_constraint(v >= time_cost[t - 1] + compute_costs[t],
-                                  f"{utils.get_linenumber()}_compute_cost@{t}")
+            v = solver.create_real_var(f"time_@{t}", lower_bound=0, upper_bound=100)
+            solver.add_constraint(
+                v >= time_cost[t - 1] + compute_costs[t],
+                f"{utils.get_linenumber()}_compute_cost@{t}",
+            )
             time_cost[t] = v
         # Communication cost
+        max_fetch_size = max([e.size for e in self.graph.edges.values()])
+        max_fetch_cost = max_fetch_size * gcd / bandwidth
+        # TODO: support max size for each tik
         for t1 in time_cost:
             for t2 in time_cost:
                 if t2 <= t1:
@@ -772,17 +810,20 @@ class Scheduler:
                 prefetch_start_end = has_prefetch_start[t1] + has_prefetch_end[t2] - 1
                 fetch_cost = prefetch_end_size[t2] / (bandwidth // gcd)
                 solver.add_constraint(
-                    time_cost[t1] + fetch_cost * prefetch_start_end <= time_cost[t2] + fetch_cost,
-                    name=f"{utils.get_linenumber()}_prefetch_cost@{t1}_to_{t2}"
+                    time_cost[t1] + fetch_cost
+                    <= time_cost[t2] + max_fetch_cost * (1 - prefetch_start_end),
+                    name=f"{utils.get_linenumber()}_prefetch_cost@{t1}_to_{t2}",
                 )
                 offload_start_end = has_offload_start[t1] + has_offload_end[t2] - 1
                 offload_cost = offload_end_size[t2] / (bandwidth // gcd)
                 solver.add_constraint(
-                    time_cost[t1] + offload_cost * offload_start_end <= time_cost[t2] + offload_cost,
-                    name=f"{utils.get_linenumber()}_offload_cost@{t1}_to_{t2}"
+                    time_cost[t1] + offload_cost
+                    <= time_cost[t2] + max_fetch_cost * (1 - offload_start_end),
+                    name=f"{utils.get_linenumber()}_offload_cost@{t1}_to_{t2}",
                 )
 
         solver.set_objective_function(time_cost[num_timesteps], maximize=False)
+        solver.write("./model.lp")
 
         start_time = time.time()
         logger.info("Start ILP solver")
@@ -820,19 +861,30 @@ class Scheduler:
             for t, v in ts.items():
                 if result[v] >= 0.99:
                     assert not generated, "No Remat is supported"
-                    assert t not in compute_schedule, "No Concurrent Compute is supported"
+                    assert (
+                        t not in compute_schedule
+                    ), "No Concurrent Compute is supported"
                     compute_schedule[t] = n
+
         def record_val_to(variables, vals):
             for e, ts in variables.items():
                 for t, v in ts.items():
                     if result[v] >= 0.99:
                         assert vals[t] is None
                         vals[t] = e
+
         record_val_to(prefetch_start_vars, prefetch_start_schedule)
         record_val_to(prefetch_end_vars, prefetch_end_schedule)
         record_val_to(offload_start_vars, offload_start_schedule)
         record_val_to(offload_end_vars, offload_end_schedule)
-        return compute_schedule, prefetch_start_schedule, prefetch_end_schedule, offload_start_schedule, offload_end_schedule
+        print("compute_schedule", compute_schedule)
+        return (
+            compute_schedule,
+            prefetch_start_schedule,
+            prefetch_end_schedule,
+            offload_start_schedule,
+            offload_end_schedule,
+        )
 
         last_uses = {}
         for e in self.graph.edges.values():
@@ -1507,7 +1559,9 @@ class Scheduler:
                             logger.debug(f"address {interval.data} used")
                             max_address_used = max(max_address_used, interval.data)
                         a.Start = max_address_used
-                        logger.debug(f"Adding gen address to intervaltree {span[0]} {span[1]}")
+                        logger.debug(
+                            f"Adding gen address to intervaltree {span[0]} {span[1]}"
+                        )
                         mem_used[span[0] : span[1] + 1] = (
                             max_address_used + t.size // gcd
                         )
@@ -1531,7 +1585,9 @@ class Scheduler:
                     mem_at_t = 0
                     for interval in min_mem_per_span[t]:
                         t = interval.data
-                        logger.debug(f"tensor {t.name} used. span was [{makespan[t][0]}, {makespan[t][1]}]")
+                        logger.debug(
+                            f"tensor {t.name} used. span was [{makespan[t][0]}, {makespan[t][1]}]"
+                        )
                         mem_at_t += t.size
                     min_mem_required = max(min_mem_required, mem_at_t)
                 min_memory_requirement = min_mem_required
@@ -1652,7 +1708,6 @@ class Scheduler:
         #####################################################
 
         elif defrag:
-
             # Maximum address that can be used
             max_address = (
                 min(self.ComputeMaximumMemoryRequired(), mem_limit)
@@ -1711,7 +1766,9 @@ class Scheduler:
                             continue
                         processed.add((t1, t2))
                         if not self.graph.can_overlap_in_time(t1, t2):
-                            logger.debug(t1.name + " and " + t2.name + "CANNOT OVERLAP 2")
+                            logger.debug(
+                                t1.name + " and " + t2.name + "CANNOT OVERLAP 2"
+                            )
                             continue
                         # Check if both t1 and t2 are live at ts.
                         generate_t1 = self.DenseGenerateOrFetchVarsMap(
