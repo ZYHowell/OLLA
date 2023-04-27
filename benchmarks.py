@@ -384,29 +384,29 @@ class Benchmark:
     #     simulated_peak_mem_usage, mem_per_timestep = s.Simulate(node_order)
     #     return (simulated_peak_mem_usage, stop - start)
 
-    def run_simulation(
+    def construct_simulator(
         self,
         g,
         model,
         fx_2_df_map,
-        node_order,
         *args,
         memory_bandwidth=int(1e11),
     ):
-        # start = time.time()
         s = simulator.Simulator(g, model, fx_2_df_map, *args, memory_bandwidth)
+        return s
+
+    def run_simulation(
+        self,
+        s,
+        node_order,
+    ):
         total_time_cost = s.default_simulate(node_order)
         return total_time_cost
 
     def run_schedule_simulate(
         self,
-        g,
-        model,
-        fx_2_df_map,
-        *args,
-        memory_bandwidth=int(1e11),
+        s,
     ):
-        s = simulator.Simulator(g, model, fx_2_df_map, *args, memory_bandwidth)
         total_time_cost = s.simulate_schedule()
         return total_time_cost
 
@@ -548,7 +548,7 @@ import argparse
 
 # fmt: off
 parser = argparse.ArgumentParser(description="MemOpt Benchmarks")
-parser.add_argument("-b", "--batch-size", "--batch-sizes", nargs="+", type=int, default=[1, 32])
+parser.add_argument("-b", "--batch-size", "--batch-sizes", nargs="+", type=int, default=[1, 32, 64])
 parser.add_argument("-m", "--model", "--models", nargs="+", type=str, default=BENCHMARKS.keys())
 parser.add_argument("--mode", "--modes", nargs="+", type=str, choices=["eval", "train"], default=None)
 
@@ -679,25 +679,26 @@ if __name__ == "__main__":
                     #     flush=True,
                     # )
                     # result["simulated.peak_mem_usage"] = simulated_peak_mem_usage / GB
-                    total_time_cost = b.run_simulation(
+                    s = b.construct_simulator(
                         graph,
                         fx_graph,
                         fx_to_df_map,
-                        pt_node_order,
                         *inputs,
                         *dict(torch_model.named_parameters()).values(),
                         *dict(torch_model.named_buffers()).values(),
+                    )
+
+                    total_time_cost = b.run_simulation(
+                        s,
+                        pt_node_order,
                     )
                     print(f"  SIMULATED TOTAL TIME COST IS {total_time_cost:.4f} s")
-                    total_time_cost_optimized = b.run_schedule_simulate(
-                        graph,
-                        fx_graph,
-                        fx_to_df_map,
-                        *inputs,
-                        *dict(torch_model.named_parameters()).values(),
-                        *dict(torch_model.named_buffers()).values(),
+
+                    total_time_cost_optimized = b.run_schedule_simulate(s)
+                    print(
+                        f"  SIMULATED TOTAL TIME COST OPTIMIZED IS {total_time_cost_optimized:.4f} s"
                     )
-                    exit(1)
+                    # exit(1)
 
                 # if args.profile_alloc_time:
                 #     torch.cuda.empty_cache()

@@ -324,9 +324,11 @@ class Scheduler:
         offloading_vars = defaultdict(lambda: {})
         prefetching_vars = defaultdict(lambda: {})
         tensor_size_map = defaultdict(lambda: 0)
-        edge_steps = lambda e, offset=0: (iter(range(1 + offset, num_timesteps + 1))
-                                          if e.is_stateful() else self.
-                                          TimeStepsForEdge(e, spans, offset))
+        edge_steps = lambda e, offset=0: (
+            iter(range(1 + offset, num_timesteps + 1))
+            if e.is_stateful()
+            else self.TimeStepsForEdge(e, spans, offset)
+        )
 
         for n in self.graph.nodes.values():
             if n.is_stateful():
@@ -339,7 +341,7 @@ class Scheduler:
         for e in self.graph.edges.values():
             lb, ub = makespan[e]
             tensor_size_map[e] = e.size // gcd
-            print(e.name, e.size)
+            # print(e.name, e.size)
             for t in edge_steps(e):
                 if e.is_stateful():
                     # Never gen a stateful var. Only prefetch or assume ready at
@@ -378,11 +380,11 @@ class Scheduler:
                 )
                 solver.add_constraint(
                     prefetch_start_vars[e][t] + prefetch_end_vars[e][t] <= 1,
-                    name=f"{utils.get_linenumber()}_{e.name}_not_immediately_prefetched{t}"
+                    name=f"{utils.get_linenumber()}_{e.name}_not_immediately_prefetched{t}",
                 )
                 solver.add_constraint(
                     offload_start_vars[e][t] + offload_end_vars[e][t] <= 1,
-                    name=f"{utils.get_linenumber()}_{e.name}_not_immediately_offloaded{t}"
+                    name=f"{utils.get_linenumber()}_{e.name}_not_immediately_offloaded{t}",
                 )
 
         # Iteratively define Ready, Prefetching, and Offloading.
@@ -867,6 +869,7 @@ class Scheduler:
         print("compute_schedule", compute_schedule)
         print(dict(prefetch_start_schedule))
         print(dict(prefetch_end_schedule))
+        print(dict(offload_start_schedule))
         print(dict(offload_end_schedule))
         return (
             compute_schedule,
